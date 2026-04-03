@@ -58,6 +58,15 @@ async function uploadToSupabase(localPath, storagePath) {
   if (error) throw error;
 }
 
+async function createSignedUrl(storagePath) {
+  const { data, error } = await supabase.storage
+    .from(STORAGE_BUCKET)
+    .createSignedUrl(storagePath, 3600);
+
+  if (error) throw error;
+  return data.signedUrl;
+}
+
 async function processOneFarm(farm) {
   const browser = await getBrowser();
   const context = await browser.newContext({ acceptDownloads: true });
@@ -116,6 +125,8 @@ async function processOneFarm(farm) {
     const storagePath = `${farm.id}/${dateStamp()}/${fileName}`;
     await uploadToSupabase(localPath, storagePath);
 
+    const signedUrl = await createSignedUrl(storagePath);
+
     await supabase.from('vic_files').insert({
       farm_id: farm.id,
       run_id: runId,
@@ -143,6 +154,7 @@ async function processOneFarm(farm) {
       success: true,
       storage_path: storagePath,
       file_name: fileName,
+      signed_url: signedUrl,
       run_id: runId,
     };
   } catch (err) {
