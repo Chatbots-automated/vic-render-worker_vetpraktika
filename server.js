@@ -1,7 +1,7 @@
 const express = require('express');
 const { chromium } = require('playwright');
 const { createClient } = require('@supabase/supabase-js');
-const pLimit = require('p-limit');
+const pLimit = require('p-limit').default;
 const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
