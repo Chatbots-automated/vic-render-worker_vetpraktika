@@ -12,11 +12,10 @@ app.use(express.json({ limit: '10mb' }));
 const PORT = process.env.PORT || 3000;
 const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN;
 const HEADLESS = String(process.env.PLAYWRIGHT_HEADLESS || 'true') === 'true';
-const MAX_PARALLEL_CONTEXTS = Number(process.env.MAX_PARALLEL_CONTEXTS || 3);
+const MAX_PARALLEL_CONTEXTS = Number(process.env.MAX_PARALLEL_CONTEXTS || 1);
 const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'vic-pdfs';
 
-const VIC_LOGIN_URL = 'https://is.vic.lt';
-const LIVE_ANIMALS_URL = 'https://ise.vic.lt/GPSAS/Ataskaitos/GyvuGyvunuSarasas';
+const VIC_LOGIN_URL = 'https://ise.vic.lt/Public/Login.aspx';
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -38,6 +37,11 @@ function fileSafe(s) {
   return String(s || '').replace(/[<>:"/\\|?*\x00-\x1F]/g, '_');
 }
 
+function normalizeValue(value) {
+  const cleaned = String(value ?? '').trim();
+  return cleaned || null;
+}
+
 function getLithuaniaTodayDate() {
   const now = new Date();
 
@@ -53,15 +57,6 @@ function getLithuaniaTodayDate() {
   const day = parts.find((p) => p.type === 'day')?.value;
 
   return `${year}-${month}-${day}`;
-}
-
-function dateStamp() {
-  return getLithuaniaTodayDate();
-}
-
-function normalizeValue(value) {
-  const cleaned = String(value ?? '').trim();
-  return cleaned || null;
 }
 
 function getVetCredentialsFromBody(body) {
@@ -93,7 +88,6 @@ function normalizeFarmInput(farm, defaultVetCredentials, defaultSearchDate) {
     id: normalizeValue(farm.id || farm.farm_id),
     name: normalizeValue(farm.name || farm.farm_name),
 
-    // This is the farm/client/holder personal or company code used in #AsmKodas
     client_personal_code:
       normalizeValue(farm.client_personal_code) ||
       normalizeValue(farm.clientPersonalCode) ||
@@ -105,7 +99,6 @@ function normalizeFarmInput(farm, defaultVetCredentials, defaultSearchDate) {
       normalizeValue(farm.farmCode) ||
       normalizeValue(farm.code),
 
-    // Vet login. Farm can override, but normally this comes from body.vet / top-level.
     vic_username:
       normalizeValue(farm.vet_vic_username) ||
       normalizeValue(farm.vetVicUsername) ||
@@ -178,18 +171,101 @@ async function getBodyTextPreview(page) {
 }
 
 async function fillInputAndTriggerEvents(page, selector, value) {
-  await page.locator(selector).waitFor({
+  const locator = page.locator(selector);
+
+  await locator.waitFor({
     state: 'visible',
     timeout: 30000,
   });
 
-  await page.fill(selector, '');
-  await page.fill(selector, String(value));
+  await locator.click({ timeout: 30000 });
+  await locator.fill('');
+  await locator.fill(String(value));
 
-  await page.locator(selector).evaluate((el) => {
+  await locator.evaluate((el) => {
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
     el.dispatchEvent(new Event('blur', { bubbles: true }));
+  });
+}
+
+async function loginToVic(page, vicUsername, vicPassword) {
+  await page.goto(VIC_LOGIN_URL, {
+    waitUntil: 'domcontentloaded',
+    timeout: 60000,
+  });
+
+  await page.locator('#ctl00_PublicPlaceHolder_UserName').waitFor({
+    state: 'visible',
+    timeout: 30000,
+  });
+
+  await page.locator('#ctl00_PublicPlaceHolder_UserName').fill(vicUsername);
+  await page.locator('#ctl00_PublicPlaceHolder_Password').fill(vicPassword);
+
+  await Promise.all([
+    page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => null),
+    page.locator('#ctl00_PublicPlaceHolder_LoginButton').click(),
+  ]);
+
+  await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
+}
+
+async function openLiveAnimalsPageViaMenu(page) {
+  // 1. Click Ūkinių gyvūnų registras
+  const gpsasLink = page.locator(
+    '#ctl00_RptMenu_ctl05_CtlMenuNode_RptMenu_ctl00_ctl00_HplMenu, a[href="https://ise.vic.lt/GPSAS"]'
+  ).first();
+
+  await gpsasLink.waitFor({
+    state: 'visible',
+    timeout: 60000,
+  });
+
+  await Promise.all([
+    page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => null),
+    gpsasLink.click(),
+  ]);
+
+  await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
+
+  // 2. Click Meniu tab
+  const menuTab = page.locator('a[data-toggle="tab"][href="#tabMeniu"], a:has-text("Meniu")').first();
+
+  await menuTab.waitFor({
+    state: 'visible',
+    timeout: 60000,
+  });
+
+  await menuTab.click();
+
+  await page.waitForTimeout(700);
+
+  // 3. Click Gyvų gyvūnų sąrašas.
+  // The link has target="_blank", so remove target to keep same page.
+  const liveAnimalsLink = page.locator(
+    'a[href="https://ise.vic.lt/GPSAS/Ataskaitos/GyvuGyvunuSarasas"], a:has-text("Gyvų gyvūnų sąrašas")'
+  ).first();
+
+  await liveAnimalsLink.waitFor({
+    state: 'visible',
+    timeout: 60000,
+  });
+
+  await liveAnimalsLink.evaluate((a) => {
+    a.removeAttribute('target');
+  });
+
+  await Promise.all([
+    page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => null),
+    liveAnimalsLink.click(),
+  ]);
+
+  await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
+
+  await page.locator('#AsmKodas').waitFor({
+    state: 'visible',
+    timeout: 60000,
   });
 }
 
@@ -209,11 +285,6 @@ async function waitForSearchResultOrState(page) {
         return visible && text.includes('Pažyma (PDF)');
       });
 
-      const hasClientCard =
-        bodyText.includes('Laikytojas') &&
-        bodyText.includes('Asmens') &&
-        (bodyText.includes('Banda') || bodyText.includes('Valda'));
-
       const hasNoDataMessage =
         bodyText.includes('Duomenų nėra') ||
         bodyText.includes('duomenų nėra') ||
@@ -230,29 +301,52 @@ async function waitForSearchResultOrState(page) {
         bodyText.includes('Neteisingas') ||
         bodyText.includes('neteisingas');
 
-      return (
-        hasPdfButton ||
-        hasClientCard ||
-        hasNoDataMessage ||
-        hasValidationMessage
-      );
+      return hasPdfButton || hasNoDataMessage || hasValidationMessage;
     },
     null,
     { timeout: 90000 }
   );
 }
 
-async function loginToVic(page, vicUsername, vicPassword) {
-  await page.goto(VIC_LOGIN_URL, {
-    waitUntil: 'domcontentloaded',
+async function clickSearch(page) {
+  const searchButton = page.locator(
+    '#searchBtn, button:has-text("Ieškoti"), span.ladda-label:has-text("Ieškoti")'
+  ).first();
+
+  await searchButton.waitFor({
+    state: 'visible',
+    timeout: 30000,
+  });
+
+  await Promise.all([
+    page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null),
+    searchButton.click(),
+  ]);
+}
+
+async function downloadPdf(page) {
+  const pdfButton = page.locator(
+    'button:has-text("Pažyma (PDF)"), a:has-text("Pažyma (PDF)"), span.ladda-label:has-text("Pažyma (PDF)")'
+  ).first();
+
+  const pdfButtonCount = await pdfButton.count();
+
+  if (!pdfButtonCount) {
+    throw new Error('PDF button was not found after search.');
+  }
+
+  await pdfButton.waitFor({
+    state: 'visible',
+    timeout: 30000,
+  });
+
+  const downloadPromise = page.waitForEvent('download', {
     timeout: 60000,
   });
 
-  await page.locator('#ctl00_PublicPlaceHolder_UserName').fill(vicUsername);
-  await page.locator('#ctl00_PublicPlaceHolder_Password').fill(vicPassword);
-  await page.locator('#ctl00_PublicPlaceHolder_LoginButton').click();
+  await pdfButton.click();
 
-  await page.waitForLoadState('networkidle', { timeout: 60000 });
+  return await downloadPromise;
 }
 
 async function processOneFarm(farm) {
@@ -272,7 +366,6 @@ async function processOneFarm(farm) {
   await fs.mkdir(tmpDir, { recursive: true });
 
   const runId = crypto.randomUUID();
-
   const startedAt = new Date().toISOString();
 
   if (!farm.id) {
@@ -304,7 +397,7 @@ async function processOneFarm(farm) {
       farm_id: farm.id,
       farm_name: farm.name,
       success: false,
-      error: 'Missing farm/client personal code for #AsmKodas.',
+      error: 'Missing client_personal_code for #AsmKodas.',
       run_id: runId,
     };
   }
@@ -318,103 +411,41 @@ async function processOneFarm(farm) {
       status: 'running',
     });
 
+    // EXACT FLOW:
+    // Login page -> login -> GPSAS -> Meniu -> Gyvų gyvūnų sąrašas.
     await loginToVic(page, farm.vic_username, farm.vic_password);
 
-    await page.goto(LIVE_ANIMALS_URL, {
-      waitUntil: 'domcontentloaded',
-      timeout: 60000,
-    });
+    await openLiveAnimalsPageViaMenu(page);
 
-    await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
-
-    // Important: this is the farm/client code search field.
+    // Enter client code.
     await fillInputAndTriggerEvents(page, '#AsmKodas', farm.client_personal_code);
 
     await page.waitForTimeout(700);
 
+    // Enter today's/search date.
     await fillInputAndTriggerEvents(page, '#PaieskosData', farm.search_date);
 
-    await page.waitForTimeout(300);
-
-    await page.keyboard.press('Tab').catch(() => null);
-
-    await page
-      .locator('h4', {
-        hasText: 'Gyvų gyvūnų sąrašas',
-      })
-      .click()
-      .catch(() => null);
+    // Press Enter inside date field.
+    await page.locator('#PaieskosData').press('Enter');
 
     await page.waitForTimeout(500);
 
-    const searchButton = page.locator('#searchBtn').first();
+    // Click off somewhere stable.
+    await page.locator('h4:has-text("Gyvų gyvūnų sąrašas")').click().catch(() => null);
 
-    if (await searchButton.count()) {
-      await Promise.all([
-        page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null),
-        searchButton.click(),
-      ]);
-    } else {
-      await Promise.all([
-        page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null),
-        page.getByRole('button', { name: /Ieškoti/i }).click(),
-      ]);
-    }
+    await page.waitForTimeout(500);
+
+    // Click Ieškoti.
+    await clickSearch(page);
 
     await page.waitForTimeout(3000);
+
     await waitForSearchResultOrState(page);
 
     const bodyTextPreviewAfterSearch = await getBodyTextPreview(page);
 
-    const pdfButton = page
-      .locator(
-        'button:has-text("Pažyma (PDF)"), a:has-text("Pažyma (PDF)"), span:has-text("Pažyma (PDF)")'
-      )
-      .first();
-
-    const pdfButtonCount = await pdfButton.count();
-
-    if (!pdfButtonCount) {
-      const shotPath = await safeScreenshot(page, tmpDir, farm.id, runId);
-
-      await supabase
-        .from('vic_download_runs')
-        .update({
-          status: 'failed',
-          finished_at: new Date().toISOString(),
-          error_message: 'PDF button was not found after search.',
-        })
-        .eq('id', runId);
-
-      await context.close().catch(() => null);
-
-      return {
-        farm_id: farm.id,
-        farm_name: farm.name,
-        client_personal_code: farm.client_personal_code,
-        search_date: farm.search_date,
-        vic_username: farm.vic_username,
-        success: false,
-        error: 'PDF button was not found after search.',
-        current_url: page.url(),
-        body_text_preview_after_search: bodyTextPreviewAfterSearch,
-        screenshot_path: shotPath,
-        run_id: runId,
-      };
-    }
-
-    await pdfButton.waitFor({
-      state: 'visible',
-      timeout: 30000,
-    });
-
-    const downloadPromise = page.waitForEvent('download', {
-      timeout: 60000,
-    });
-
-    await pdfButton.click();
-
-    const download = await downloadPromise;
+    // Click Pažyma (PDF) and download.
+    const download = await downloadPdf(page);
 
     const fileName = `live-animals-${farm.client_personal_code}-${farm.search_date}.pdf`;
     const localPath = path.join(
@@ -464,6 +495,7 @@ async function processOneFarm(farm) {
       run_id: runId,
       started_at: startedAt,
       finished_at: new Date().toISOString(),
+      body_text_preview_after_search: bodyTextPreviewAfterSearch,
     };
   } catch (err) {
     const errorMessage = err.message || String(err);
@@ -479,7 +511,6 @@ async function processOneFarm(farm) {
       .catch(() => null);
 
     const shotPath = await safeScreenshot(page, tmpDir, farm.id, runId);
-
     const bodyTextPreview = await getBodyTextPreview(page);
 
     await context.close().catch(() => null);
@@ -508,6 +539,7 @@ app.post('/run-batch', requireInternalAuth, async (req, res) => {
   const rawFarms = Array.isArray(req.body.farms) ? req.body.farms : [];
 
   const defaultVetCredentials = getVetCredentialsFromBody(req.body);
+
   const defaultSearchDate =
     normalizeValue(req.body.search_date) ||
     normalizeValue(req.body.searchDate) ||
