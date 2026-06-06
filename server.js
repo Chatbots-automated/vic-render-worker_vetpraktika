@@ -16,6 +16,8 @@ const MAX_PARALLEL_CONTEXTS = Number(process.env.MAX_PARALLEL_CONTEXTS || 1);
 const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'vic-pdfs';
 
 const VIC_LOGIN_URL = 'https://ise.vic.lt/Public/Login.aspx';
+const GPSAS_URL = 'https://ise.vic.lt/GPSAS';
+const LIVE_ANIMALS_URL = 'https://ise.vic.lt/GPSAS/Ataskaitos/GyvuGyvunuSarasas';
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -286,7 +288,8 @@ async function loginToVic(page, vicUsername, vicPassword) {
   await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
 }
 
-async function openLiveAnimalsPageViaMenu(page) {
+async function openLiveAnimalsPage(page) {
+  // First enter GPSAS through the visible registry menu link.
   const gpsasLink = page
     .locator(
       '#ctl00_RptMenu_ctl05_CtlMenuNode_RptMenu_ctl00_ctl00_HplMenu, a[href="https://ise.vic.lt/GPSAS"]'
@@ -305,37 +308,12 @@ async function openLiveAnimalsPageViaMenu(page) {
 
   await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
 
-  const menuTab = page
-    .locator('a[data-toggle="tab"][href="#tabMeniu"], a:has-text("Meniu")')
-    .first();
-
-  await menuTab.waitFor({
-    state: 'visible',
+  // Do NOT click hidden report menu link.
+  // Once GPSAS session is active, direct navigation is reliable.
+  await page.goto(LIVE_ANIMALS_URL, {
+    waitUntil: 'domcontentloaded',
     timeout: 60000,
   });
-
-  await menuTab.click();
-  await page.waitForTimeout(700);
-
-  const liveAnimalsLink = page
-    .locator(
-      'a[href="https://ise.vic.lt/GPSAS/Ataskaitos/GyvuGyvunuSarasas"], a:has-text("Gyvų gyvūnų sąrašas")'
-    )
-    .first();
-
-  await liveAnimalsLink.waitFor({
-    state: 'visible',
-    timeout: 60000,
-  });
-
-  await liveAnimalsLink.evaluate((a) => {
-    a.removeAttribute('target');
-  });
-
-  await Promise.all([
-    page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => null),
-    liveAnimalsLink.click(),
-  ]);
 
   await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
 
@@ -478,14 +456,18 @@ async function processOneFarm(farm) {
   try {
     await insertRun(runId, farm);
 
+    console.log(`[${runId}] Logging into VIC as ${farm.vic_username}`);
     await loginToVic(page, farm.vic_username, farm.vic_password);
 
-    await openLiveAnimalsPageViaMenu(page);
+    console.log(`[${runId}] Opening live animals page`);
+    await openLiveAnimalsPage(page);
 
+    console.log(`[${runId}] Filling client code ${farm.client_personal_code}`);
     await fillInputAndTriggerEvents(page, '#AsmKodas', farm.client_personal_code);
 
     await page.waitForTimeout(700);
 
+    console.log(`[${runId}] Filling search date ${farm.search_date}`);
     await fillInputAndTriggerEvents(page, '#PaieskosData', farm.search_date);
 
     await page.locator('#PaieskosData').press('Enter');
@@ -499,6 +481,7 @@ async function processOneFarm(farm) {
 
     await page.waitForTimeout(500);
 
+    console.log(`[${runId}] Clicking search`);
     await clickSearch(page);
 
     await page.waitForTimeout(3000);
@@ -507,6 +490,7 @@ async function processOneFarm(farm) {
 
     const bodyTextPreviewAfterSearch = await getBodyTextPreview(page);
 
+    console.log(`[${runId}] Downloading PDF`);
     const download = await downloadPdf(page);
 
     const fileName = `live-animals-${farm.client_personal_code}-${farm.search_date}.pdf`;
@@ -520,6 +504,7 @@ async function processOneFarm(farm) {
 
     const storagePath = `${farm.id}/${farm.search_date}/${fileName}`;
 
+    console.log(`[${runId}] Uploading to Supabase ${storagePath}`);
     await uploadToSupabase(localPath, storagePath);
 
     const signedUrl = await createSignedUrl(storagePath);
