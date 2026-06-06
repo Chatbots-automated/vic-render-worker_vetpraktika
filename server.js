@@ -150,6 +150,81 @@ async function createSignedUrl(storagePath) {
   return data.signedUrl;
 }
 
+async function insertRun(runId, farm) {
+  try {
+    const { error } = await supabase.from('vic_download_runs').insert({
+      id: runId,
+      farm_id: farm.id,
+      farm_name: farm.name,
+      vic_username: farm.vic_username,
+      status: 'running',
+    });
+
+    if (error) {
+      console.error('[insertRun] Supabase error:', error);
+    }
+  } catch (err) {
+    console.error('[insertRun] fatal:', err.message || err);
+  }
+}
+
+async function updateRunSuccess(runId, storagePath) {
+  try {
+    const { error } = await supabase
+      .from('vic_download_runs')
+      .update({
+        status: 'success',
+        storage_path: storagePath,
+        finished_at: new Date().toISOString(),
+        error_message: null,
+      })
+      .eq('id', runId);
+
+    if (error) {
+      console.error('[updateRunSuccess] Supabase error:', error);
+    }
+  } catch (err) {
+    console.error('[updateRunSuccess] fatal:', err.message || err);
+  }
+}
+
+async function updateRunFailed(runId, errorMessage) {
+  try {
+    const { error } = await supabase
+      .from('vic_download_runs')
+      .update({
+        status: 'failed',
+        finished_at: new Date().toISOString(),
+        error_message: errorMessage,
+      })
+      .eq('id', runId);
+
+    if (error) {
+      console.error('[updateRunFailed] Supabase error:', error);
+    }
+  } catch (err) {
+    console.error('[updateRunFailed] fatal:', err.message || err);
+  }
+}
+
+async function insertVicFile({ farmId, runId, storagePath, fileName }) {
+  try {
+    const { error } = await supabase.from('vic_files').insert({
+      farm_id: farmId,
+      run_id: runId,
+      bucket: STORAGE_BUCKET,
+      storage_path: storagePath,
+      file_name: fileName,
+    });
+
+    if (error) {
+      console.error('[insertVicFile] Supabase error:', error);
+    }
+  } catch (err) {
+    console.error('[insertVicFile] fatal:', err.message || err);
+  }
+}
+
 async function safeScreenshot(page, tmpDir, farmId, runId) {
   try {
     const shotPath = path.join(tmpDir, `${farmId || 'unknown'}-${runId}-error.png`);
@@ -212,10 +287,11 @@ async function loginToVic(page, vicUsername, vicPassword) {
 }
 
 async function openLiveAnimalsPageViaMenu(page) {
-  // 1. Click Ūkinių gyvūnų registras
-  const gpsasLink = page.locator(
-    '#ctl00_RptMenu_ctl05_CtlMenuNode_RptMenu_ctl00_ctl00_HplMenu, a[href="https://ise.vic.lt/GPSAS"]'
-  ).first();
+  const gpsasLink = page
+    .locator(
+      '#ctl00_RptMenu_ctl05_CtlMenuNode_RptMenu_ctl00_ctl00_HplMenu, a[href="https://ise.vic.lt/GPSAS"]'
+    )
+    .first();
 
   await gpsasLink.waitFor({
     state: 'visible',
@@ -229,8 +305,9 @@ async function openLiveAnimalsPageViaMenu(page) {
 
   await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
 
-  // 2. Click Meniu tab
-  const menuTab = page.locator('a[data-toggle="tab"][href="#tabMeniu"], a:has-text("Meniu")').first();
+  const menuTab = page
+    .locator('a[data-toggle="tab"][href="#tabMeniu"], a:has-text("Meniu")')
+    .first();
 
   await menuTab.waitFor({
     state: 'visible',
@@ -238,14 +315,13 @@ async function openLiveAnimalsPageViaMenu(page) {
   });
 
   await menuTab.click();
-
   await page.waitForTimeout(700);
 
-  // 3. Click Gyvų gyvūnų sąrašas.
-  // The link has target="_blank", so remove target to keep same page.
-  const liveAnimalsLink = page.locator(
-    'a[href="https://ise.vic.lt/GPSAS/Ataskaitos/GyvuGyvunuSarasas"], a:has-text("Gyvų gyvūnų sąrašas")'
-  ).first();
+  const liveAnimalsLink = page
+    .locator(
+      'a[href="https://ise.vic.lt/GPSAS/Ataskaitos/GyvuGyvunuSarasas"], a:has-text("Gyvų gyvūnų sąrašas")'
+    )
+    .first();
 
   await liveAnimalsLink.waitFor({
     state: 'visible',
@@ -309,9 +385,9 @@ async function waitForSearchResultOrState(page) {
 }
 
 async function clickSearch(page) {
-  const searchButton = page.locator(
-    '#searchBtn, button:has-text("Ieškoti"), span.ladda-label:has-text("Ieškoti")'
-  ).first();
+  const searchButton = page
+    .locator('#searchBtn, button:has-text("Ieškoti")')
+    .first();
 
   await searchButton.waitFor({
     state: 'visible',
@@ -325,23 +401,17 @@ async function clickSearch(page) {
 }
 
 async function downloadPdf(page) {
-  const pdfButton = page.locator(
-    'button:has-text("Pažyma (PDF)"), a:has-text("Pažyma (PDF)"), span.ladda-label:has-text("Pažyma (PDF)")'
-  ).first();
-
-  const pdfButtonCount = await pdfButton.count();
-
-  if (!pdfButtonCount) {
-    throw new Error('PDF button was not found after search.');
-  }
+  const pdfButton = page
+    .locator('button:has-text("Pažyma (PDF)"), a:has-text("Pažyma (PDF)")')
+    .first();
 
   await pdfButton.waitFor({
     state: 'visible',
-    timeout: 30000,
+    timeout: 60000,
   });
 
   const downloadPromise = page.waitForEvent('download', {
-    timeout: 60000,
+    timeout: 90000,
   });
 
   await pdfButton.click();
@@ -402,40 +472,33 @@ async function processOneFarm(farm) {
     };
   }
 
-  try {
-    await supabase.from('vic_download_runs').insert({
-      id: runId,
-      farm_id: farm.id,
-      farm_name: farm.name,
-      vic_username: farm.vic_username,
-      status: 'running',
-    });
+  let currentUrl = null;
+  let localPath = null;
 
-    // EXACT FLOW:
-    // Login page -> login -> GPSAS -> Meniu -> Gyvų gyvūnų sąrašas.
+  try {
+    await insertRun(runId, farm);
+
     await loginToVic(page, farm.vic_username, farm.vic_password);
 
     await openLiveAnimalsPageViaMenu(page);
 
-    // Enter client code.
     await fillInputAndTriggerEvents(page, '#AsmKodas', farm.client_personal_code);
 
     await page.waitForTimeout(700);
 
-    // Enter today's/search date.
     await fillInputAndTriggerEvents(page, '#PaieskosData', farm.search_date);
 
-    // Press Enter inside date field.
     await page.locator('#PaieskosData').press('Enter');
 
     await page.waitForTimeout(500);
 
-    // Click off somewhere stable.
-    await page.locator('h4:has-text("Gyvų gyvūnų sąrašas")').click().catch(() => null);
+    await page
+      .locator('h4:has-text("Gyvų gyvūnų sąrašas")')
+      .click()
+      .catch(() => null);
 
     await page.waitForTimeout(500);
 
-    // Click Ieškoti.
     await clickSearch(page);
 
     await page.waitForTimeout(3000);
@@ -444,11 +507,11 @@ async function processOneFarm(farm) {
 
     const bodyTextPreviewAfterSearch = await getBodyTextPreview(page);
 
-    // Click Pažyma (PDF) and download.
     const download = await downloadPdf(page);
 
     const fileName = `live-animals-${farm.client_personal_code}-${farm.search_date}.pdf`;
-    const localPath = path.join(
+
+    localPath = path.join(
       tmpDir,
       `${farm.id}-${runId}-${fileSafe(fileName)}`
     );
@@ -461,25 +524,20 @@ async function processOneFarm(farm) {
 
     const signedUrl = await createSignedUrl(storagePath);
 
-    await supabase.from('vic_files').insert({
-      farm_id: farm.id,
-      run_id: runId,
-      bucket: STORAGE_BUCKET,
-      storage_path: storagePath,
-      file_name: fileName,
+    await insertVicFile({
+      farmId: farm.id,
+      runId,
+      storagePath,
+      fileName,
     });
 
-    await supabase
-      .from('vic_download_runs')
-      .update({
-        status: 'success',
-        storage_path: storagePath,
-        finished_at: new Date().toISOString(),
-        error_message: null,
-      })
-      .eq('id', runId);
+    await updateRunSuccess(runId, storagePath);
 
     await fs.unlink(localPath).catch(() => null);
+    localPath = null;
+
+    currentUrl = page.url();
+
     await context.close().catch(() => null);
 
     return {
@@ -495,23 +553,26 @@ async function processOneFarm(farm) {
       run_id: runId,
       started_at: startedAt,
       finished_at: new Date().toISOString(),
+      current_url: currentUrl,
       body_text_preview_after_search: bodyTextPreviewAfterSearch,
     };
   } catch (err) {
     const errorMessage = err.message || String(err);
 
-    await supabase
-      .from('vic_download_runs')
-      .update({
-        status: 'failed',
-        finished_at: new Date().toISOString(),
-        error_message: errorMessage,
-      })
-      .eq('id', runId)
-      .catch(() => null);
+    try {
+      currentUrl = page.url();
+    } catch {
+      currentUrl = null;
+    }
 
-    const shotPath = await safeScreenshot(page, tmpDir, farm.id, runId);
     const bodyTextPreview = await getBodyTextPreview(page);
+    const shotPath = await safeScreenshot(page, tmpDir, farm.id, runId);
+
+    await updateRunFailed(runId, errorMessage);
+
+    if (localPath) {
+      await fs.unlink(localPath).catch(() => null);
+    }
 
     await context.close().catch(() => null);
 
@@ -523,7 +584,7 @@ async function processOneFarm(farm) {
       vic_username: farm.vic_username,
       success: false,
       error: errorMessage,
-      current_url: page.url(),
+      current_url: currentUrl,
       body_text_preview: bodyTextPreview,
       screenshot_path: shotPath,
       run_id: runId,
@@ -536,28 +597,47 @@ app.get('/health', (_req, res) => {
 });
 
 app.post('/run-batch', requireInternalAuth, async (req, res) => {
-  const rawFarms = Array.isArray(req.body.farms) ? req.body.farms : [];
+  try {
+    console.log('[run-batch] incoming body:', JSON.stringify({
+      hasVet: !!req.body.vet,
+      farmCount: Array.isArray(req.body.farms) ? req.body.farms.length : 0,
+      searchDate: req.body.search_date || req.body.searchDate || null,
+    }));
 
-  const defaultVetCredentials = getVetCredentialsFromBody(req.body);
+    const rawFarms = Array.isArray(req.body.farms) ? req.body.farms : [];
 
-  const defaultSearchDate =
-    normalizeValue(req.body.search_date) ||
-    normalizeValue(req.body.searchDate) ||
-    getLithuaniaTodayDate();
+    const defaultVetCredentials = getVetCredentialsFromBody(req.body);
 
-  const farms = rawFarms.map((farm) =>
-    normalizeFarmInput(farm, defaultVetCredentials, defaultSearchDate)
-  );
+    const defaultSearchDate =
+      normalizeValue(req.body.search_date) ||
+      normalizeValue(req.body.searchDate) ||
+      getLithuaniaTodayDate();
 
-  const results = await Promise.all(
-    farms.map((farm) => limit(() => processOneFarm(farm)))
-  );
+    const farms = rawFarms.map((farm) =>
+      normalizeFarmInput(farm, defaultVetCredentials, defaultSearchDate)
+    );
 
-  res.json({
-    ok: true,
-    count: results.length,
-    results,
-  });
+    const results = [];
+
+    for (const farm of farms) {
+      const result = await limit(() => processOneFarm(farm));
+      results.push(result);
+    }
+
+    return res.json({
+      ok: true,
+      count: results.length,
+      results,
+    });
+  } catch (err) {
+    console.error('[run-batch] fatal error:', err);
+
+    return res.status(500).json({
+      ok: false,
+      error: err.message || String(err),
+      stack: err.stack || null,
+    });
+  }
 });
 
 app.listen(PORT, () => {
