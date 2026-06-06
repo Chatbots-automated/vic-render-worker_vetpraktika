@@ -6,6 +6,8 @@ const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
 
+console.log('SERVER VERSION: vic-vet-login-client-code-stage-debug-v4');
+
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
@@ -132,22 +134,40 @@ async function getBrowser() {
 async function uploadToSupabase(localPath, storagePath) {
   const fileBuffer = await fs.readFile(localPath);
 
-  const { error } = await supabase.storage
+  console.log(`[supabase] uploading bucket=${STORAGE_BUCKET} path=${storagePath} bytes=${fileBuffer.length}`);
+
+  const { data, error } = await supabase.storage
     .from(STORAGE_BUCKET)
     .upload(storagePath, fileBuffer, {
       contentType: 'application/pdf',
       upsert: true,
     });
 
-  if (error) throw error;
+  if (error) {
+    console.error('[supabase] upload error raw:', error);
+
+    throw new Error(
+      `Supabase upload failed: ${error.message || JSON.stringify(error)} | bucket=${STORAGE_BUCKET} | path=${storagePath}`
+    );
+  }
+
+  return data;
 }
 
 async function createSignedUrl(storagePath) {
+  console.log(`[supabase] creating signed url bucket=${STORAGE_BUCKET} path=${storagePath}`);
+
   const { data, error } = await supabase.storage
     .from(STORAGE_BUCKET)
     .createSignedUrl(storagePath, 3600);
 
-  if (error) throw error;
+  if (error) {
+    console.error('[supabase] signed url error raw:', error);
+
+    throw new Error(
+      `Supabase signed URL failed: ${error.message || JSON.stringify(error)} | bucket=${STORAGE_BUCKET} | path=${storagePath}`
+    );
+  }
 
   return data.signedUrl;
 }
@@ -289,7 +309,6 @@ async function loginToVic(page, vicUsername, vicPassword) {
 }
 
 async function openLiveAnimalsPage(page) {
-  // First enter GPSAS through the visible registry menu link.
   const gpsasLink = page
     .locator(
       '#ctl00_RptMenu_ctl05_CtlMenuNode_RptMenu_ctl00_ctl00_HplMenu, a[href="https://ise.vic.lt/GPSAS"]'
@@ -308,8 +327,6 @@ async function openLiveAnimalsPage(page) {
 
   await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
 
-  // Do NOT click hidden report menu link.
-  // Once GPSAS session is active, direct navigation is reliable.
   await page.goto(LIVE_ANIMALS_URL, {
     waitUntil: 'domcontentloaded',
     timeout: 60000,
@@ -421,6 +438,7 @@ async function processOneFarm(farm) {
 
     return {
       success: false,
+      stage: 'validation',
       error: 'Missing farm id.',
       run_id: runId,
     };
@@ -433,6 +451,7 @@ async function processOneFarm(farm) {
       farm_id: farm.id,
       farm_name: farm.name,
       success: false,
+      stage: 'validation',
       error: 'Missing vet VIC credentials.',
       run_id: runId,
     };
@@ -445,6 +464,7 @@ async function processOneFarm(farm) {
       farm_id: farm.id,
       farm_name: farm.name,
       success: false,
+      stage: 'validation',
       error: 'Missing client_personal_code for #AsmKodas.',
       run_id: runId,
     };
@@ -452,28 +472,37 @@ async function processOneFarm(farm) {
 
   let currentUrl = null;
   let localPath = null;
+  let stage = 'started';
+  let bodyTextPreviewAfterSearch = null;
 
   try {
+    stage = 'insert_run';
     await insertRun(runId, farm);
 
+    stage = 'login';
     console.log(`[${runId}] Logging into VIC as ${farm.vic_username}`);
     await loginToVic(page, farm.vic_username, farm.vic_password);
 
+    stage = 'open_live_animals_page';
     console.log(`[${runId}] Opening live animals page`);
     await openLiveAnimalsPage(page);
 
+    stage = 'fill_client_code';
     console.log(`[${runId}] Filling client code ${farm.client_personal_code}`);
     await fillInputAndTriggerEvents(page, '#AsmKodas', farm.client_personal_code);
 
     await page.waitForTimeout(700);
 
+    stage = 'fill_search_date';
     console.log(`[${runId}] Filling search date ${farm.search_date}`);
     await fillInputAndTriggerEvents(page, '#PaieskosData', farm.search_date);
 
+    stage = 'press_enter_date';
     await page.locator('#PaieskosData').press('Enter');
 
     await page.waitForTimeout(500);
 
+    stage = 'click_h4_blur';
     await page
       .locator('h4:has-text("Gyvų gyvūnų sąrašas")')
       .click()
@@ -481,18 +510,22 @@ async function processOneFarm(farm) {
 
     await page.waitForTimeout(500);
 
+    stage = 'click_search';
     console.log(`[${runId}] Clicking search`);
     await clickSearch(page);
 
     await page.waitForTimeout(3000);
 
+    stage = 'wait_for_search_result';
     await waitForSearchResultOrState(page);
 
-    const bodyTextPreviewAfterSearch = await getBodyTextPreview(page);
+    bodyTextPreviewAfterSearch = await getBodyTextPreview(page);
 
+    stage = 'download_pdf';
     console.log(`[${runId}] Downloading PDF`);
     const download = await downloadPdf(page);
 
+    stage = 'save_pdf_local';
     const fileName = `live-animals-${farm.client_personal_code}-${farm.search_date}.pdf`;
 
     localPath = path.join(
@@ -504,11 +537,14 @@ async function processOneFarm(farm) {
 
     const storagePath = `${farm.id}/${farm.search_date}/${fileName}`;
 
+    stage = 'upload_supabase';
     console.log(`[${runId}] Uploading to Supabase ${storagePath}`);
     await uploadToSupabase(localPath, storagePath);
 
+    stage = 'create_signed_url';
     const signedUrl = await createSignedUrl(storagePath);
 
+    stage = 'insert_vic_file';
     await insertVicFile({
       farmId: farm.id,
       runId,
@@ -516,6 +552,7 @@ async function processOneFarm(farm) {
       fileName,
     });
 
+    stage = 'update_run_success';
     await updateRunSuccess(runId, storagePath);
 
     await fs.unlink(localPath).catch(() => null);
@@ -532,6 +569,7 @@ async function processOneFarm(farm) {
       search_date: farm.search_date,
       vic_username: farm.vic_username,
       success: true,
+      stage: 'done',
       storage_path: storagePath,
       file_name: fileName,
       signed_url: signedUrl,
@@ -553,7 +591,7 @@ async function processOneFarm(farm) {
     const bodyTextPreview = await getBodyTextPreview(page);
     const shotPath = await safeScreenshot(page, tmpDir, farm.id, runId);
 
-    await updateRunFailed(runId, errorMessage);
+    await updateRunFailed(runId, `[${stage}] ${errorMessage}`);
 
     if (localPath) {
       await fs.unlink(localPath).catch(() => null);
@@ -568,8 +606,10 @@ async function processOneFarm(farm) {
       search_date: farm.search_date,
       vic_username: farm.vic_username,
       success: false,
+      stage,
       error: errorMessage,
       current_url: currentUrl,
+      body_text_preview_after_search: bodyTextPreviewAfterSearch,
       body_text_preview: bodyTextPreview,
       screenshot_path: shotPath,
       run_id: runId,
@@ -578,7 +618,7 @@ async function processOneFarm(farm) {
 }
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true });
+  res.json({ ok: true, version: 'vic-vet-login-client-code-stage-debug-v4' });
 });
 
 app.post('/run-batch', requireInternalAuth, async (req, res) => {
