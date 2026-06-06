@@ -6,7 +6,7 @@ const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
 
-console.log('SERVER VERSION: vic-vet-login-client-code-retry-login-v5');
+console.log('SERVER VERSION: vic-vet-login-client-code-no-records-v6');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -270,6 +270,21 @@ async function getBodyTextPreview(page) {
   }
 }
 
+async function detectNoRecords(page) {
+  const bodyText = await getBodyTextPreview(page);
+
+  const noRecords =
+    (bodyText || '').includes('Pagal pasirinktus paieškos kriterijus įrašų nerasta') ||
+    (bodyText || '').includes('įrašų nerasta') ||
+    (bodyText || '').includes('Duomenų nėra') ||
+    (bodyText || '').includes('Nėra duomenų');
+
+  return {
+    noRecords,
+    bodyText,
+  };
+}
+
 async function fillInputAndTriggerEvents(page, selector, value) {
   const locator = page.locator(selector);
 
@@ -304,7 +319,6 @@ async function fillLoginField(page, selector, value) {
 
   await locator.fill('');
 
-  // Slower typing is more stable with old ASP.NET forms.
   await locator.type(String(value), { delay: 35 });
 
   await locator.evaluate((el) => {
@@ -509,6 +523,8 @@ async function waitForSearchResultOrState(page) {
       });
 
       const hasNoDataMessage =
+        bodyText.includes('Pagal pasirinktus paieškos kriterijus įrašų nerasta') ||
+        bodyText.includes('įrašų nerasta') ||
         bodyText.includes('Duomenų nėra') ||
         bodyText.includes('duomenų nėra') ||
         bodyText.includes('Nerasta') ||
@@ -552,10 +568,26 @@ async function downloadPdf(page) {
     .locator('button:has-text("Pažyma (PDF)"), a:has-text("Pažyma (PDF)")')
     .first();
 
-  await pdfButton.waitFor({
-    state: 'visible',
-    timeout: 60000,
-  });
+  const count = await pdfButton.count();
+
+  if (!count) {
+    throw new Error('PDF button does not exist. Probably no records found.');
+  }
+
+  const isVisible = await pdfButton.isVisible().catch(() => false);
+
+  if (!isVisible) {
+    const bodyText = await getBodyTextPreview(page);
+
+    if (
+      (bodyText || '').includes('įrašų nerasta') ||
+      (bodyText || '').includes('Pagal pasirinktus paieškos kriterijus')
+    ) {
+      throw new Error('No records found, PDF button is hidden.');
+    }
+
+    throw new Error('PDF button exists but is hidden.');
+  }
 
   const downloadPromise = page.waitForEvent('download', {
     timeout: 90000,
@@ -671,7 +703,35 @@ async function processOneFarm(farm) {
     stage = 'wait_for_search_result';
     await waitForSearchResultOrState(page);
 
-    bodyTextPreviewAfterSearch = await getBodyTextPreview(page);
+    const noRecordCheck = await detectNoRecords(page);
+    bodyTextPreviewAfterSearch = noRecordCheck.bodyText;
+
+    if (noRecordCheck.noRecords) {
+      stage = 'no_records_found';
+
+      await updateRunFailed(
+        runId,
+        `[${stage}] No records found for client_personal_code=${farm.client_personal_code}`
+      );
+
+      currentUrl = page.url();
+
+      await context.close().catch(() => null);
+
+      return {
+        farm_id: farm.id,
+        farm_name: farm.name,
+        client_personal_code: farm.client_personal_code,
+        search_date: farm.search_date,
+        vic_username: farm.vic_username,
+        success: false,
+        stage,
+        error: 'No records found for selected search criteria.',
+        current_url: currentUrl,
+        body_text_preview_after_search: bodyTextPreviewAfterSearch,
+        run_id: runId,
+      };
+    }
 
     stage = 'download_pdf';
     console.log(`[${runId}] Downloading PDF`);
@@ -772,7 +832,7 @@ async function processOneFarm(farm) {
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
-    version: 'vic-vet-login-client-code-retry-login-v5',
+    version: 'vic-vet-login-client-code-no-records-v6',
   });
 });
 
