@@ -6,7 +6,7 @@ const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
 
-console.log('SERVER VERSION: vic-vet-login-client-code-stage-debug-v4');
+console.log('SERVER VERSION: vic-vet-login-client-code-retry-login-v5');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -18,7 +18,6 @@ const MAX_PARALLEL_CONTEXTS = Number(process.env.MAX_PARALLEL_CONTEXTS || 1);
 const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'vic-pdfs';
 
 const VIC_LOGIN_URL = 'https://ise.vic.lt/Public/Login.aspx';
-const GPSAS_URL = 'https://ise.vic.lt/GPSAS';
 const LIVE_ANIMALS_URL = 'https://ise.vic.lt/GPSAS/Ataskaitos/GyvuGyvunuSarasas';
 
 const supabase = createClient(
@@ -134,7 +133,9 @@ async function getBrowser() {
 async function uploadToSupabase(localPath, storagePath) {
   const fileBuffer = await fs.readFile(localPath);
 
-  console.log(`[supabase] uploading bucket=${STORAGE_BUCKET} path=${storagePath} bytes=${fileBuffer.length}`);
+  console.log(
+    `[supabase] uploading bucket=${STORAGE_BUCKET} path=${storagePath} bytes=${fileBuffer.length}`
+  );
 
   const { data, error } = await supabase.storage
     .from(STORAGE_BUCKET)
@@ -155,7 +156,9 @@ async function uploadToSupabase(localPath, storagePath) {
 }
 
 async function createSignedUrl(storagePath) {
-  console.log(`[supabase] creating signed url bucket=${STORAGE_BUCKET} path=${storagePath}`);
+  console.log(
+    `[supabase] creating signed url bucket=${STORAGE_BUCKET} path=${storagePath}`
+  );
 
   const { data, error } = await supabase.storage
     .from(STORAGE_BUCKET)
@@ -286,46 +289,195 @@ async function fillInputAndTriggerEvents(page, selector, value) {
   });
 }
 
-async function loginToVic(page, vicUsername, vicPassword) {
-  await page.goto(VIC_LOGIN_URL, {
-    waitUntil: 'domcontentloaded',
-    timeout: 60000,
-  });
+async function fillLoginField(page, selector, value) {
+  const locator = page.locator(selector);
 
-  await page.locator('#ctl00_PublicPlaceHolder_UserName').waitFor({
+  await locator.waitFor({
     state: 'visible',
     timeout: 30000,
   });
 
-  await page.locator('#ctl00_PublicPlaceHolder_UserName').fill(vicUsername);
-  await page.locator('#ctl00_PublicPlaceHolder_Password').fill(vicPassword);
+  await locator.click({ timeout: 30000 });
 
-  await Promise.all([
-    page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => null),
-    page.locator('#ctl00_PublicPlaceHolder_LoginButton').click(),
-  ]);
+  await page.keyboard.press('Control+A').catch(() => null);
+  await page.keyboard.press('Meta+A').catch(() => null);
 
-  await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
+  await locator.fill('');
+
+  // Slower typing is more stable with old ASP.NET forms.
+  await locator.type(String(value), { delay: 35 });
+
+  await locator.evaluate((el) => {
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new Event('blur', { bubbles: true }));
+  });
+
+  const actualValue = await locator.inputValue().catch(() => '');
+
+  if (!actualValue) {
+    throw new Error(`Login field did not fill correctly: ${selector}`);
+  }
+}
+
+async function waitForLoginResult(page) {
+  return await page.waitForFunction(
+    () => {
+      const bodyText = document.body.innerText || '';
+
+      const hasGpsasLink =
+        !!document.querySelector(
+          '#ctl00_RptMenu_ctl05_CtlMenuNode_RptMenu_ctl00_ctl00_HplMenu'
+        ) ||
+        Array.from(document.querySelectorAll('a')).some((a) => {
+          const href = a.href || '';
+          const text = a.textContent || '';
+
+          return (
+            href.includes('/GPSAS') ||
+            text.includes('Ūkinių gyvūnų registras')
+          );
+        });
+
+      const stillOnLogin =
+        !!document.querySelector('#ctl00_PublicPlaceHolder_UserName') ||
+        !!document.querySelector('#ctl00_PublicPlaceHolder_Password');
+
+      const hasLoginError =
+        bodyText.includes('Būtinas laukas') ||
+        bodyText.includes('Neteisingas') ||
+        bodyText.includes('neteisingas') ||
+        bodyText.includes('Nepavyko') ||
+        bodyText.includes('Klaida');
+
+      return hasGpsasLink || (stillOnLogin && hasLoginError);
+    },
+    null,
+    { timeout: 60000 }
+  );
+}
+
+async function loginToVic(page, vicUsername, vicPassword) {
+  const maxAttempts = 3;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    console.log(`[loginToVic] attempt ${attempt}/${maxAttempts}`);
+
+    await page.goto(VIC_LOGIN_URL, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000,
+    });
+
+    await page.waitForTimeout(800);
+
+    await fillLoginField(
+      page,
+      '#ctl00_PublicPlaceHolder_UserName',
+      vicUsername
+    );
+
+    await page.waitForTimeout(300);
+
+    await fillLoginField(
+      page,
+      '#ctl00_PublicPlaceHolder_Password',
+      vicPassword
+    );
+
+    await page.waitForTimeout(300);
+
+    const usernameValue = await page
+      .locator('#ctl00_PublicPlaceHolder_UserName')
+      .inputValue()
+      .catch(() => '');
+
+    const passwordValue = await page
+      .locator('#ctl00_PublicPlaceHolder_Password')
+      .inputValue()
+      .catch(() => '');
+
+    console.log(
+      `[loginToVic] usernameFilled=${!!usernameValue} passwordFilled=${!!passwordValue}`
+    );
+
+    if (!usernameValue || !passwordValue) {
+      if (attempt === maxAttempts) {
+        throw new Error('Login fields were empty before submit.');
+      }
+
+      await page.waitForTimeout(1000);
+      continue;
+    }
+
+    await Promise.all([
+      page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => null),
+      page.locator('#ctl00_PublicPlaceHolder_LoginButton').click(),
+    ]);
+
+    await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
+
+    await waitForLoginResult(page).catch(() => null);
+
+    const bodyText = await getBodyTextPreview(page);
+    const currentUrl = page.url();
+
+    const gpsasLinkCount = await page
+      .locator(
+        '#ctl00_RptMenu_ctl05_CtlMenuNode_RptMenu_ctl00_ctl00_HplMenu, a[href="https://ise.vic.lt/GPSAS"], a[href*="/GPSAS"]'
+      )
+      .count()
+      .catch(() => 0);
+
+    const loggedIn =
+      currentUrl.includes('/GPSAS') ||
+      (bodyText || '').includes('Ūkinių gyvūnų registras') ||
+      gpsasLinkCount > 0;
+
+    if (loggedIn) {
+      console.log('[loginToVic] login success');
+      return;
+    }
+
+    console.log(`[loginToVic] login not confirmed, currentUrl=${currentUrl}`);
+    console.log(`[loginToVic] body preview: ${(bodyText || '').slice(0, 500)}`);
+
+    if (attempt === maxAttempts) {
+      throw new Error(
+        `VIC login failed after ${maxAttempts} attempts. Preview: ${(bodyText || '').slice(0, 500)}`
+      );
+    }
+
+    await page.waitForTimeout(1500);
+  }
 }
 
 async function openLiveAnimalsPage(page) {
-  const gpsasLink = page
-    .locator(
-      '#ctl00_RptMenu_ctl05_CtlMenuNode_RptMenu_ctl00_ctl00_HplMenu, a[href="https://ise.vic.lt/GPSAS"]'
-    )
-    .first();
+  const currentUrl = page.url();
+  const bodyText = await getBodyTextPreview(page);
 
-  await gpsasLink.waitFor({
-    state: 'visible',
-    timeout: 60000,
-  });
+  const alreadyInsideGpsas =
+    currentUrl.includes('/GPSAS') ||
+    (bodyText || '').includes('Ūkinių gyvūnų registras');
 
-  await Promise.all([
-    page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => null),
-    gpsasLink.click(),
-  ]);
+  if (!alreadyInsideGpsas) {
+    const gpsasLink = page
+      .locator(
+        '#ctl00_RptMenu_ctl05_CtlMenuNode_RptMenu_ctl00_ctl00_HplMenu, a[href="https://ise.vic.lt/GPSAS"], a[href*="/GPSAS"]'
+      )
+      .first();
 
-  await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
+    await gpsasLink.waitFor({
+      state: 'visible',
+      timeout: 60000,
+    });
+
+    await Promise.all([
+      page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => null),
+      gpsasLink.click(),
+    ]);
+
+    await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
+  }
 
   await page.goto(LIVE_ANIMALS_URL, {
     waitUntil: 'domcontentloaded',
@@ -618,7 +770,10 @@ async function processOneFarm(farm) {
 }
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, version: 'vic-vet-login-client-code-stage-debug-v4' });
+  res.json({
+    ok: true,
+    version: 'vic-vet-login-client-code-retry-login-v5',
+  });
 });
 
 app.post('/run-batch', requireInternalAuth, async (req, res) => {
