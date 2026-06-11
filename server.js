@@ -6,7 +6,7 @@ const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
 
-console.log('SERVER VERSION: vic-vet-login-client-code-date-clean-no-pdf-v7');
+console.log('SERVER VERSION: vic-vet-login-client-code-stable-v8');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -50,22 +50,6 @@ function normalizeCompact(value) {
   return cleaned || null;
 }
 
-function normalizeDateValue(value, fallbackDate) {
-  const compact = String(value ?? '').replace(/\s+/g, '').trim();
-
-  if (/^\d{4}-\d{2}-\d{2}$/.test(compact)) {
-    return compact;
-  }
-
-  const digitsOnly = compact.replace(/[^\d]/g, '');
-
-  if (digitsOnly.length === 8) {
-    return `${digitsOnly.slice(0, 4)}-${digitsOnly.slice(4, 6)}-${digitsOnly.slice(6, 8)}`;
-  }
-
-  return fallbackDate || getLithuaniaTodayDate();
-}
-
 function getLithuaniaTodayDate() {
   const now = new Date();
 
@@ -81,6 +65,22 @@ function getLithuaniaTodayDate() {
   const day = parts.find((p) => p.type === 'day')?.value;
 
   return `${year}-${month}-${day}`;
+}
+
+function normalizeDateValue(value, fallbackDate) {
+  const compact = String(value ?? '').replace(/\s+/g, '').trim();
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(compact)) {
+    return compact;
+  }
+
+  const digitsOnly = compact.replace(/[^\d]/g, '');
+
+  if (digitsOnly.length === 8) {
+    return `${digitsOnly.slice(0, 4)}-${digitsOnly.slice(4, 6)}-${digitsOnly.slice(6, 8)}`;
+  }
+
+  return fallbackDate || getLithuaniaTodayDate();
 }
 
 function getVetCredentialsFromBody(body) {
@@ -331,23 +331,31 @@ async function detectLoadedResults(page) {
 }
 
 async function getPdfButtonState(page) {
-  const pdfButton = page
-    .locator('button:has-text("Pažyma (PDF)"), a:has-text("Pažyma (PDF)")')
-    .first();
+  const pdfButton = page.locator('#printBtn').first();
 
-  const count = await pdfButton.count().catch(() => 0);
+  const exists = (await pdfButton.count().catch(() => 0)) > 0;
 
-  if (!count) {
+  if (!exists) {
     return {
       exists: false,
       visible: false,
     };
   }
 
-  const visible = await pdfButton.isVisible().catch(() => false);
+  const visible = await pdfButton
+    .evaluate((el) => {
+      const style = window.getComputedStyle(el);
+
+      return (
+        el.offsetParent !== null &&
+        style.display !== 'none' &&
+        style.visibility !== 'hidden'
+      );
+    })
+    .catch(() => false);
 
   return {
-    exists: true,
+    exists,
     visible,
   };
 }
@@ -369,6 +377,47 @@ async function fillInputAndTriggerEvents(page, selector, value) {
     el.dispatchEvent(new Event('change', { bubbles: true }));
     el.dispatchEvent(new Event('blur', { bubbles: true }));
   });
+
+  await page.waitForTimeout(400);
+}
+
+async function fillClientCode(page, code) {
+  const locator = page.locator('#AsmKodas');
+
+  await locator.waitFor({
+    state: 'visible',
+    timeout: 30000,
+  });
+
+  await locator.click({ timeout: 30000 });
+  await locator.fill('');
+  await locator.type(String(code), { delay: 25 });
+
+  await page.waitForTimeout(700);
+
+  await locator.evaluate((el) => {
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+
+  await locator.press('Enter').catch(() => null);
+  await page.waitForTimeout(600);
+
+  await locator.press('Tab').catch(() => null);
+  await page.waitForTimeout(700);
+
+  await locator.evaluate((el) => {
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new Event('blur', { bubbles: true }));
+  });
+
+  const actual = await locator.inputValue().catch(() => '');
+  const expectedClean = String(code).replace(/\s+/g, '');
+  const actualClean = String(actual).replace(/\s+/g, '');
+
+  if (!actualClean || actualClean !== expectedClean) {
+    throw new Error(`AsmKodas did not fill correctly. expected=${code} actual=${actual}`);
+  }
 }
 
 async function fillLoginField(page, selector, value) {
@@ -385,7 +434,6 @@ async function fillLoginField(page, selector, value) {
   await page.keyboard.press('Meta+A').catch(() => null);
 
   await locator.fill('');
-
   await locator.type(String(value), { delay: 35 });
 
   await locator.evaluate((el) => {
@@ -496,7 +544,6 @@ async function loginToVic(page, vicUsername, vicPassword) {
     ]);
 
     await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
-
     await waitForLoginResult(page).catch(() => null);
 
     const bodyText = await getBodyTextPreview(page);
@@ -578,19 +625,13 @@ async function waitForSearchResultOrState(page) {
     () => {
       const bodyText = document.body.innerText || '';
 
-      const pdfButton = Array.from(
-        document.querySelectorAll('button, a')
-      ).find((el) => {
-        const text = el.textContent || '';
-        return text.includes('Pažyma (PDF)');
-      });
+      const pdfButton = document.querySelector('#printBtn');
 
       const hasVisiblePdfButton =
         !!pdfButton &&
-        (pdfButton.offsetParent !== null ||
-          window.getComputedStyle(pdfButton).display !== 'none');
-
-      const hasHiddenPdfButton = !!pdfButton;
+        pdfButton.offsetParent !== null &&
+        window.getComputedStyle(pdfButton).display !== 'none' &&
+        window.getComputedStyle(pdfButton).visibility !== 'hidden';
 
       const hasHolder =
         bodyText.includes('Laikytojas') &&
@@ -624,7 +665,6 @@ async function waitForSearchResultOrState(page) {
 
       return (
         hasVisiblePdfButton ||
-        hasHiddenPdfButton ||
         hasHolder ||
         hasHerd ||
         hasSummary ||
@@ -654,29 +694,32 @@ async function clickSearch(page) {
 }
 
 async function downloadPdf(page) {
-  const pdfButton = page
-    .locator('button:has-text("Pažyma (PDF)"), a:has-text("Pažyma (PDF)")')
-    .first();
+  const pdfButton = page.locator('#printBtn').first();
 
-  const count = await pdfButton.count();
+  const exists = (await pdfButton.count().catch(() => 0)) > 0;
 
-  if (!count) {
-    throw new Error('PDF button does not exist. Probably no records found.');
+  if (!exists) {
+    throw new Error('PDF button #printBtn does not exist.');
   }
 
-  const isVisible = await pdfButton.isVisible().catch(() => false);
+  const visible = await pdfButton
+    .evaluate((el) => {
+      const style = window.getComputedStyle(el);
 
-  if (!isVisible) {
+      return (
+        el.offsetParent !== null &&
+        style.display !== 'none' &&
+        style.visibility !== 'hidden'
+      );
+    })
+    .catch(() => false);
+
+  if (!visible) {
     const bodyText = await getBodyTextPreview(page);
 
-    if (
-      (bodyText || '').includes('įrašų nerasta') ||
-      (bodyText || '').includes('Pagal pasirinktus paieškos kriterijus')
-    ) {
-      throw new Error('No records found, PDF button is hidden.');
-    }
-
-    throw new Error('PDF button exists but is hidden.');
+    throw new Error(
+      `PDF button #printBtn exists but is hidden. Preview: ${(bodyText || '').slice(0, 700)}`
+    );
   }
 
   const downloadPromise = page.waitForEvent('download', {
@@ -686,6 +729,37 @@ async function downloadPdf(page) {
   await pdfButton.click();
 
   return await downloadPromise;
+}
+
+async function runSearchAndInspect(page, farm, runId) {
+  console.log(`[${runId}] Clicking search`);
+  await clickSearch(page);
+
+  await page.waitForTimeout(5000);
+
+  await waitForSearchResultOrState(page);
+
+  await page.waitForTimeout(1500);
+
+  const noRecordCheck = await detectNoRecords(page);
+  const resultCheck = await detectLoadedResults(page);
+  const pdfState = await getPdfButtonState(page);
+
+  const bodyText =
+    resultCheck.bodyText ||
+    noRecordCheck.bodyText ||
+    (await getBodyTextPreview(page));
+
+  console.log(
+    `[${runId}] search inspected noRecords=${noRecordCheck.noRecords} hasResults=${resultCheck.hasResults} pdfExists=${pdfState.exists} pdfVisible=${pdfState.visible}`
+  );
+
+  return {
+    noRecordCheck,
+    resultCheck,
+    pdfState,
+    bodyText,
+  };
 }
 
 async function processOneFarm(farm) {
@@ -763,7 +837,7 @@ async function processOneFarm(farm) {
 
     stage = 'fill_client_code';
     console.log(`[${runId}] Filling client code ${farm.client_personal_code}`);
-    await fillInputAndTriggerEvents(page, '#AsmKodas', farm.client_personal_code);
+    await fillClientCode(page, farm.client_personal_code);
 
     await page.waitForTimeout(700);
 
@@ -784,25 +858,39 @@ async function processOneFarm(farm) {
 
     await page.waitForTimeout(500);
 
-    stage = 'click_search';
-    console.log(`[${runId}] Clicking search`);
-    await clickSearch(page);
-
-    await page.waitForTimeout(3500);
-
     stage = 'wait_for_search_result';
-    await waitForSearchResultOrState(page);
 
-    await page.waitForTimeout(1000);
+    let inspection = await runSearchAndInspect(page, farm, runId);
 
-    const noRecordCheck = await detectNoRecords(page);
-    const resultCheck = await detectLoadedResults(page);
-    const pdfState = await getPdfButtonState(page);
+    // Retry once if VIC did not load results and did not show no-record message.
+    if (
+      !inspection.noRecordCheck.noRecords &&
+      !inspection.resultCheck.hasResults &&
+      !inspection.pdfState.visible
+    ) {
+      console.log(`[${runId}] No clear result after first search, retrying once`);
 
-    bodyTextPreviewAfterSearch =
-      resultCheck.bodyText || noRecordCheck.bodyText || (await getBodyTextPreview(page));
+      await page.waitForTimeout(1200);
 
-    if (noRecordCheck.noRecords) {
+      await fillClientCode(page, farm.client_personal_code);
+      await page.waitForTimeout(700);
+
+      await fillInputAndTriggerEvents(page, '#PaieskosData', farm.search_date);
+      await page.locator('#PaieskosData').press('Enter').catch(() => null);
+
+      await page
+        .locator('h4:has-text("Gyvų gyvūnų sąrašas")')
+        .click()
+        .catch(() => null);
+
+      await page.waitForTimeout(800);
+
+      inspection = await runSearchAndInspect(page, farm, runId);
+    }
+
+    bodyTextPreviewAfterSearch = inspection.bodyText;
+
+    if (inspection.noRecordCheck.noRecords) {
       stage = 'no_records_found';
 
       await updateRunFailed(
@@ -829,12 +917,12 @@ async function processOneFarm(farm) {
       };
     }
 
-    if (!pdfState.visible) {
+    if (!inspection.pdfState.visible) {
       stage = 'no_pdf_available';
 
       await updateRunFailed(
         runId,
-        `[${stage}] PDF button hidden or unavailable. hasResults=${resultCheck.hasResults}, pdfExists=${pdfState.exists}`
+        `[${stage}] PDF button hidden or unavailable. hasResults=${inspection.resultCheck.hasResults}, pdfExists=${inspection.pdfState.exists}`
       );
 
       currentUrl = page.url();
@@ -849,7 +937,7 @@ async function processOneFarm(farm) {
         vic_username: farm.vic_username,
         success: false,
         stage,
-        error: `PDF button hidden or unavailable. hasResults=${resultCheck.hasResults}, pdfExists=${pdfState.exists}`,
+        error: `PDF button hidden or unavailable. hasResults=${inspection.resultCheck.hasResults}, pdfExists=${inspection.pdfState.exists}`,
         current_url: currentUrl,
         body_text_preview_after_search: bodyTextPreviewAfterSearch,
         run_id: runId,
@@ -955,7 +1043,7 @@ async function processOneFarm(farm) {
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
-    version: 'vic-vet-login-client-code-date-clean-no-pdf-v7',
+    version: 'vic-vet-login-client-code-stable-v8',
   });
 });
 
