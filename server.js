@@ -6,7 +6,7 @@ const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
 
-console.log('SERVER VERSION: vic-vet-login-client-code-no-records-v6');
+console.log('SERVER VERSION: vic-vet-login-client-code-date-clean-no-pdf-v7');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -43,6 +43,27 @@ function fileSafe(s) {
 function normalizeValue(value) {
   const cleaned = String(value ?? '').trim();
   return cleaned || null;
+}
+
+function normalizeCompact(value) {
+  const cleaned = String(value ?? '').replace(/\s+/g, '').trim();
+  return cleaned || null;
+}
+
+function normalizeDateValue(value, fallbackDate) {
+  const compact = String(value ?? '').replace(/\s+/g, '').trim();
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(compact)) {
+    return compact;
+  }
+
+  const digitsOnly = compact.replace(/[^\d]/g, '');
+
+  if (digitsOnly.length === 8) {
+    return `${digitsOnly.slice(0, 4)}-${digitsOnly.slice(4, 6)}-${digitsOnly.slice(6, 8)}`;
+  }
+
+  return fallbackDate || getLithuaniaTodayDate();
 }
 
 function getLithuaniaTodayDate() {
@@ -92,15 +113,15 @@ function normalizeFarmInput(farm, defaultVetCredentials, defaultSearchDate) {
     name: normalizeValue(farm.name || farm.farm_name),
 
     client_personal_code:
-      normalizeValue(farm.client_personal_code) ||
-      normalizeValue(farm.clientPersonalCode) ||
-      normalizeValue(farm.personal_code) ||
-      normalizeValue(farm.personalCode) ||
-      normalizeValue(farm.holder_code) ||
-      normalizeValue(farm.holderCode) ||
-      normalizeValue(farm.farm_code) ||
-      normalizeValue(farm.farmCode) ||
-      normalizeValue(farm.code),
+      normalizeCompact(farm.client_personal_code) ||
+      normalizeCompact(farm.clientPersonalCode) ||
+      normalizeCompact(farm.personal_code) ||
+      normalizeCompact(farm.personalCode) ||
+      normalizeCompact(farm.holder_code) ||
+      normalizeCompact(farm.holderCode) ||
+      normalizeCompact(farm.farm_code) ||
+      normalizeCompact(farm.farmCode) ||
+      normalizeCompact(farm.code),
 
     vic_username:
       normalizeValue(farm.vet_vic_username) ||
@@ -114,11 +135,10 @@ function normalizeFarmInput(farm, defaultVetCredentials, defaultSearchDate) {
       normalizeValue(farm.vic_password) ||
       defaultVetCredentials.vic_password,
 
-    search_date:
-      normalizeValue(farm.search_date) ||
-      normalizeValue(farm.searchDate) ||
-      defaultSearchDate ||
-      getLithuaniaTodayDate(),
+    search_date: normalizeDateValue(
+      farm.search_date || farm.searchDate || defaultSearchDate,
+      getLithuaniaTodayDate()
+    ),
   };
 }
 
@@ -277,11 +297,58 @@ async function detectNoRecords(page) {
     (bodyText || '').includes('Pagal pasirinktus paieškos kriterijus įrašų nerasta') ||
     (bodyText || '').includes('įrašų nerasta') ||
     (bodyText || '').includes('Duomenų nėra') ||
-    (bodyText || '').includes('Nėra duomenų');
+    (bodyText || '').includes('duomenų nėra') ||
+    (bodyText || '').includes('Nėra duomenų') ||
+    (bodyText || '').includes('nėra duomenų') ||
+    (bodyText || '').includes('Nerasta') ||
+    (bodyText || '').includes('nerasta');
 
   return {
     noRecords,
     bodyText,
+  };
+}
+
+async function detectLoadedResults(page) {
+  const bodyText = await getBodyTextPreview(page);
+
+  const hasHolder =
+    (bodyText || '').includes('Laikytojas') &&
+    (bodyText || '').includes('Asmens/įmonės kodas');
+
+  const hasHerd =
+    (bodyText || '').includes('Banda') &&
+    (bodyText || '').includes('Rūšis');
+
+  const hasSummary =
+    (bodyText || '').includes('Iš viso ataskaitoje') ||
+    (bodyText || '').includes('Iš viso:');
+
+  return {
+    hasResults: hasHolder || hasHerd || hasSummary,
+    bodyText,
+  };
+}
+
+async function getPdfButtonState(page) {
+  const pdfButton = page
+    .locator('button:has-text("Pažyma (PDF)"), a:has-text("Pažyma (PDF)")')
+    .first();
+
+  const count = await pdfButton.count().catch(() => 0);
+
+  if (!count) {
+    return {
+      exists: false,
+      visible: false,
+    };
+  }
+
+  const visible = await pdfButton.isVisible().catch(() => false);
+
+  return {
+    exists: true,
+    visible,
   };
 }
 
@@ -511,16 +578,31 @@ async function waitForSearchResultOrState(page) {
     () => {
       const bodyText = document.body.innerText || '';
 
-      const hasPdfButton = Array.from(
-        document.querySelectorAll('button, a, span')
-      ).some((el) => {
+      const pdfButton = Array.from(
+        document.querySelectorAll('button, a')
+      ).find((el) => {
         const text = el.textContent || '';
-        const visible =
-          el.offsetParent !== null ||
-          window.getComputedStyle(el).display !== 'none';
-
-        return visible && text.includes('Pažyma (PDF)');
+        return text.includes('Pažyma (PDF)');
       });
+
+      const hasVisiblePdfButton =
+        !!pdfButton &&
+        (pdfButton.offsetParent !== null ||
+          window.getComputedStyle(pdfButton).display !== 'none');
+
+      const hasHiddenPdfButton = !!pdfButton;
+
+      const hasHolder =
+        bodyText.includes('Laikytojas') &&
+        bodyText.includes('Asmens/įmonės kodas');
+
+      const hasHerd =
+        bodyText.includes('Banda') &&
+        bodyText.includes('Rūšis');
+
+      const hasSummary =
+        bodyText.includes('Iš viso ataskaitoje') ||
+        bodyText.includes('Iš viso:');
 
       const hasNoDataMessage =
         bodyText.includes('Pagal pasirinktus paieškos kriterijus įrašų nerasta') ||
@@ -540,7 +622,15 @@ async function waitForSearchResultOrState(page) {
         bodyText.includes('Neteisingas') ||
         bodyText.includes('neteisingas');
 
-      return hasPdfButton || hasNoDataMessage || hasValidationMessage;
+      return (
+        hasVisiblePdfButton ||
+        hasHiddenPdfButton ||
+        hasHolder ||
+        hasHerd ||
+        hasSummary ||
+        hasNoDataMessage ||
+        hasValidationMessage
+      );
     },
     null,
     { timeout: 90000 }
@@ -698,13 +788,19 @@ async function processOneFarm(farm) {
     console.log(`[${runId}] Clicking search`);
     await clickSearch(page);
 
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(3500);
 
     stage = 'wait_for_search_result';
     await waitForSearchResultOrState(page);
 
+    await page.waitForTimeout(1000);
+
     const noRecordCheck = await detectNoRecords(page);
-    bodyTextPreviewAfterSearch = noRecordCheck.bodyText;
+    const resultCheck = await detectLoadedResults(page);
+    const pdfState = await getPdfButtonState(page);
+
+    bodyTextPreviewAfterSearch =
+      resultCheck.bodyText || noRecordCheck.bodyText || (await getBodyTextPreview(page));
 
     if (noRecordCheck.noRecords) {
       stage = 'no_records_found';
@@ -727,6 +823,33 @@ async function processOneFarm(farm) {
         success: false,
         stage,
         error: 'No records found for selected search criteria.',
+        current_url: currentUrl,
+        body_text_preview_after_search: bodyTextPreviewAfterSearch,
+        run_id: runId,
+      };
+    }
+
+    if (!pdfState.visible) {
+      stage = 'no_pdf_available';
+
+      await updateRunFailed(
+        runId,
+        `[${stage}] PDF button hidden or unavailable. hasResults=${resultCheck.hasResults}, pdfExists=${pdfState.exists}`
+      );
+
+      currentUrl = page.url();
+
+      await context.close().catch(() => null);
+
+      return {
+        farm_id: farm.id,
+        farm_name: farm.name,
+        client_personal_code: farm.client_personal_code,
+        search_date: farm.search_date,
+        vic_username: farm.vic_username,
+        success: false,
+        stage,
+        error: `PDF button hidden or unavailable. hasResults=${resultCheck.hasResults}, pdfExists=${pdfState.exists}`,
         current_url: currentUrl,
         body_text_preview_after_search: bodyTextPreviewAfterSearch,
         run_id: runId,
@@ -832,7 +955,7 @@ async function processOneFarm(farm) {
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
-    version: 'vic-vet-login-client-code-no-records-v6',
+    version: 'vic-vet-login-client-code-date-clean-no-pdf-v7',
   });
 });
 
@@ -848,10 +971,10 @@ app.post('/run-batch', requireInternalAuth, async (req, res) => {
 
     const defaultVetCredentials = getVetCredentialsFromBody(req.body);
 
-    const defaultSearchDate =
-      normalizeValue(req.body.search_date) ||
-      normalizeValue(req.body.searchDate) ||
-      getLithuaniaTodayDate();
+    const defaultSearchDate = normalizeDateValue(
+      req.body.search_date || req.body.searchDate,
+      getLithuaniaTodayDate()
+    );
 
     const farms = rawFarms.map((farm) =>
       normalizeFarmInput(farm, defaultVetCredentials, defaultSearchDate)
