@@ -4,20 +4,15 @@ const fs = require('fs/promises');
 const fsSync = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const archiver = require('archiver');
 
-console.log('SERVER VERSION: vic-direct-pdf-zip-stream-v2.1');
+console.log('SERVER VERSION: vic-single-pdf-stream-v3');
 
 const app = express();
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 3000;
 const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN;
 const HEADLESS = String(process.env.PLAYWRIGHT_HEADLESS || 'true') === 'true';
-
-// This is the max parallel Playwright browser contexts.
-// For Render, start with 1 or 2. Do NOT set this to 64.
-const MAX_PARALLEL_CONTEXTS = Number(process.env.MAX_PARALLEL_CONTEXTS || 1);
 
 const VIC_LOGIN_URL = 'https://ise.vic.lt/Public/Login.aspx';
 const LIVE_ANIMALS_URL = 'https://ise.vic.lt/GPSAS/Ataskaitos/GyvuGyvunuSarasas';
@@ -118,7 +113,9 @@ function getVetCredentialsFromBody(body) {
   };
 }
 
-function normalizeFarmInput(farm, defaultVetCredentials, defaultSearchDate) {
+function normalizeFarmInput(body, defaultVetCredentials, defaultSearchDate) {
+  const farm = body.farm || body;
+
   return {
     id: normalizeValue(farm.id || farm.farm_id),
     name: normalizeValue(farm.name || farm.farm_name),
@@ -147,7 +144,7 @@ function normalizeFarmInput(farm, defaultVetCredentials, defaultSearchDate) {
       defaultVetCredentials.vic_password,
 
     search_date: normalizeDateValue(
-      farm.search_date || farm.searchDate || defaultSearchDate,
+      farm.search_date || farm.searchDate || body.search_date || body.searchDate || defaultSearchDate,
       getLithuaniaTodayDate()
     )
   };
@@ -157,7 +154,11 @@ async function getBrowser() {
   if (!browser) {
     browser = await chromium.launch({
       headless: HEADLESS,
-      args: ['--disable-dev-shm-usage']
+      args: [
+        '--disable-dev-shm-usage',
+        '--no-sandbox',
+        '--disable-setuid-sandbox'
+      ]
     });
   }
 
@@ -701,8 +702,8 @@ async function processFarmToPdf(farm) {
   const context = await b.newContext({
     acceptDownloads: true,
     viewport: {
-      width: 1400,
-      height: 900
+      width: 1200,
+      height: 800
     }
   });
 
@@ -805,9 +806,12 @@ async function processFarmToPdf(farm) {
     const download = await downloadPdf(page);
     const suggestedName = download.suggestedFilename();
 
+    const cleanFarmName = fileSafe(farm.name || farm.id || 'farm');
+    const cleanCode = fileSafe(farm.client_personal_code || 'code');
+
     const finalFileName = fileSafe(
       suggestedName ||
-        `live-animals-${farm.name || farm.id}-${farm.client_personal_code}-${farm.search_date}.pdf`
+        `live-animals-${cleanFarmName}-${cleanCode}-${farm.search_date}.pdf`
     );
 
     localPath = path.join(
@@ -818,7 +822,6 @@ async function processFarmToPdf(farm) {
     await download.saveAs(localPath);
 
     const stat = await fs.stat(localPath);
-
     const currentUrl = page.url();
 
     await context.close().catch(() => null);
@@ -857,72 +860,20 @@ async function processFarmToPdf(farm) {
   }
 }
 
-async function runWithConcurrency(items, concurrency, worker) {
-  const results = new Array(items.length);
-  let nextIndex = 0;
-
-  async function runner() {
-    while (nextIndex < items.length) {
-      const currentIndex = nextIndex;
-      nextIndex += 1;
-
-      results[currentIndex] = await worker(items[currentIndex], currentIndex);
-    }
+async function closeBrowserAfterRequest() {
+  // Important for Render memory.
+  // Closing Chromium after each farm prevents memory buildup.
+  if (browser) {
+    await browser.close().catch(() => null);
+    browser = null;
   }
-
-  const runnerCount = Math.min(concurrency, items.length);
-  const runners = [];
-
-  for (let i = 0; i < runnerCount; i++) {
-    runners.push(runner());
-  }
-
-  await Promise.all(runners);
-
-  return results;
-}
-
-async function cleanupResultFiles(results) {
-  for (const result of results || []) {
-    if (result?.file_path) {
-      await fs.unlink(result.file_path).catch(() => null);
-    }
-  }
-}
-
-function buildManifest(results) {
-  return {
-    ok: true,
-    created_at: new Date().toISOString(),
-    total: results.length,
-    success_count: results.filter((r) => r.success).length,
-    failed_count: results.filter((r) => !r.success).length,
-    results: results.map((r) => ({
-      run_id: r.run_id,
-      farm_id: r.farm_id,
-      farm_name: r.farm_name,
-      client_personal_code: r.client_personal_code,
-      search_date: r.search_date,
-      success: r.success,
-      stage: r.stage,
-      error: r.error || null,
-      file_name: r.zip_file_name || r.file_name || null,
-      file_size: r.file_size || null,
-      current_url: r.current_url || null,
-      body_text_preview: r.body_text_preview || r.body_text_preview_after_search || null,
-      screenshot_path: r.screenshot_path || null,
-      started_at: r.started_at,
-      finished_at: r.finished_at
-    }))
-  };
 }
 
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
-    version: 'vic-direct-pdf-zip-stream-v2.1',
-    headless: HEADLESS,
-    max_parallel_contexts: MAX_PARALLEL_CONTEXTS
+    version: 'vic-single-pdf-stream-v3',
+    headless: HEADLESS
   });
 });
 
@@ -937,15 +888,15 @@ app.post('/download-live-animals-pdf', requireInternalAuth, async (req, res) => 
       getLithuaniaTodayDate()
     );
 
-    const rawFarm = req.body.farm || req.body;
-
     const farm = normalizeFarmInput(
-      rawFarm,
+      req.body,
       defaultVetCredentials,
       defaultSearchDate
     );
 
     result = await processFarmToPdf(farm);
+
+    await closeBrowserAfterRequest();
 
     if (!result.success) {
       return res.status(422).json({
@@ -954,7 +905,10 @@ app.post('/download-live-animals-pdf', requireInternalAuth, async (req, res) => 
       });
     }
 
-    const fileName = fileSafe(result.file_name || 'live-animals.pdf');
+    const fileName = fileSafe(
+      `live-animals-${result.farm_name || result.farm_id}-${result.client_personal_code}-${result.search_date}.pdf`
+    );
+
     const stat = await fs.stat(result.file_path);
 
     res.setHeader('Content-Type', 'application/pdf');
@@ -999,6 +953,8 @@ app.post('/download-live-animals-pdf', requireInternalAuth, async (req, res) => 
       await fs.unlink(result.file_path).catch(() => null);
     }
 
+    await closeBrowserAfterRequest();
+
     return res.status(500).json({
       ok: false,
       error: err.message || String(err),
@@ -1007,153 +963,25 @@ app.post('/download-live-animals-pdf', requireInternalAuth, async (req, res) => 
   }
 });
 
-app.post('/download-live-animals-pdfs', requireInternalAuth, async (req, res) => {
-  let results = [];
-
-  try {
-    const rawFarms = Array.isArray(req.body.farms) ? req.body.farms : [];
-
-    if (rawFarms.length === 0) {
-      return res.status(400).json({
-        ok: false,
-        error: 'No farms provided. Expected body.farms array.'
-      });
-    }
-
-    const defaultVetCredentials = getVetCredentialsFromBody(req.body);
-
-    const defaultSearchDate = normalizeDateValue(
-      req.body.search_date || req.body.searchDate,
-      getLithuaniaTodayDate()
-    );
-
-    const farms = rawFarms.map((farm) =>
-      normalizeFarmInput(farm, defaultVetCredentials, defaultSearchDate)
-    );
-
-    const requestedConcurrency = Number(req.body.concurrency || MAX_PARALLEL_CONTEXTS);
-
-    const concurrency = Math.max(
-      1,
-      Math.min(requestedConcurrency, MAX_PARALLEL_CONTEXTS, farms.length)
-    );
-
-    console.log(
-      `[download-live-animals-pdfs] farms=${farms.length}, concurrency=${concurrency}`
-    );
-
-    results = await runWithConcurrency(farms, concurrency, async (farm, index) => {
-      console.log(
-        `[batch] ${index + 1}/${farms.length} starting farm=${farm.name} code=${farm.client_personal_code}`
-      );
-
-      const result = await processFarmToPdf(farm);
-
-      console.log(
-        `[batch] ${index + 1}/${farms.length} finished success=${result.success} stage=${result.stage}`
-      );
-
-      return result;
-    });
-
-    for (const result of results) {
-      if (!result.success || !result.file_path) continue;
-
-      const baseName = fileSafe(
-        `${result.farm_name || result.farm_id || 'farm'}-${result.client_personal_code || 'code'}-${result.search_date || 'date'}.pdf`
-      );
-
-      result.zip_file_name = `pdfs/${baseName.endsWith('.pdf') ? baseName : `${baseName}.pdf`}`;
-    }
-
-    const zipName = `vic-live-animals-${defaultSearchDate}-${Date.now()}.zip`;
-
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader(
-      'Content-Disposition',
-      `attachment; filename="${zipName}"`
-    );
-    res.setHeader('X-Total-Farms', String(results.length));
-    res.setHeader('X-Success-Count', String(results.filter((r) => r.success).length));
-    res.setHeader('X-Failed-Count', String(results.filter((r) => !r.success).length));
-
-    const archive = archiver('zip', {
-      zlib: { level: 1 }
-    });
-
-    archive.on('error', async (err) => {
-      console.error('[zip] archive error:', err);
-
-      await cleanupResultFiles(results).catch(() => null);
-
-      if (!res.headersSent) {
-        res.status(500).json({
-          ok: false,
-          error: err.message || String(err)
-        });
-      } else {
-        res.end();
-      }
-    });
-
-    archive.on('end', async () => {
-      await cleanupResultFiles(results).catch(() => null);
-    });
-
-    archive.pipe(res);
-
-    archive.append(JSON.stringify(buildManifest(results), null, 2), {
-      name: 'manifest.json'
-    });
-
-    for (const result of results) {
-      if (!result.success || !result.file_path) continue;
-
-      archive.file(result.file_path, {
-        name: result.zip_file_name
-      });
-    }
-
-    return archive.finalize();
-  } catch (err) {
-    console.error('[download-live-animals-pdfs] fatal:', err);
-
-    await cleanupResultFiles(results).catch(() => null);
-
-    return res.status(500).json({
-      ok: false,
-      error: err.message || String(err),
-      stack: err.stack || null,
-      partial_results: results.map((r) => ({
-        farm_id: r.farm_id,
-        farm_name: r.farm_name,
-        success: r.success,
-        stage: r.stage,
-        error: r.error || null
-      }))
-    });
-  }
-});
-
-// Backwards-compatible alias if some old n8n node still calls /run-batch.
+// Backwards-compatible route.
+// It returns only ONE PDF, not ZIP.
+// If old n8n still calls /run-batch with farms[0], it will use the first farm.
 app.post('/run-batch', requireInternalAuth, async (req, res) => {
-  req.url = '/download-live-animals-pdfs';
+  if (Array.isArray(req.body.farms) && req.body.farms.length > 0) {
+    req.body.farm = req.body.farms[0];
+  }
+
+  req.url = '/download-live-animals-pdf';
   return app._router.handle(req, res);
 });
 
 process.on('SIGINT', async () => {
-  if (browser) {
-    await browser.close().catch(() => null);
-  }
-
+  await closeBrowserAfterRequest();
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
-  if (browser) {
-    await browser.close().catch(() => null);
-  }
-
+  await closeBrowserAfterRequest();
   process.exit(0);
 });
 
