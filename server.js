@@ -1,43 +1,45 @@
 const express = require('express');
 const { chromium } = require('playwright');
-const { createClient } = require('@supabase/supabase-js');
-const pLimit = require('p-limit').default;
 const fs = require('fs/promises');
+const fsSync = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const archiver = require('archiver');
 
-console.log('SERVER VERSION: vic-vet-login-client-code-stable-v8');
+console.log('SERVER VERSION: vic-direct-pdf-zip-v2');
 
 const app = express();
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '25mb' }));
 
 const PORT = process.env.PORT || 3000;
 const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN;
 const HEADLESS = String(process.env.PLAYWRIGHT_HEADLESS || 'true') === 'true';
-const MAX_PARALLEL_CONTEXTS = Number(process.env.MAX_PARALLEL_CONTEXTS || 1);
-const STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || 'vic-pdfs';
+
+// Important: do not set this to 50.
+// 50 farms can be submitted at once, but the worker should process a few in parallel.
+const MAX_PARALLEL_CONTEXTS = Number(process.env.MAX_PARALLEL_CONTEXTS || 4);
 
 const VIC_LOGIN_URL = 'https://ise.vic.lt/Public/Login.aspx';
 const LIVE_ANIMALS_URL = 'https://ise.vic.lt/GPSAS/Ataskaitos/GyvuGyvunuSarasas';
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
-
 let browser;
-const limit = pLimit(MAX_PARALLEL_CONTEXTS);
 
 function requireInternalAuth(req, res, next) {
+  if (!INTERNAL_TOKEN) {
+    return res.status(500).json({
+      ok: false,
+      error: 'Missing INTERNAL_TOKEN environment variable.'
+    });
+  }
+
   if (req.headers['x-internal-token'] !== INTERNAL_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized' });
+    return res.status(401).json({
+      ok: false,
+      error: 'Unauthorized'
+    });
   }
 
   next();
-}
-
-function fileSafe(s) {
-  return String(s || '').replace(/[<>:"/\\|?*\x00-\x1F]/g, '_');
 }
 
 function normalizeValue(value) {
@@ -50,15 +52,20 @@ function normalizeCompact(value) {
   return cleaned || null;
 }
 
-function getLithuaniaTodayDate() {
-  const now = new Date();
+function fileSafe(value) {
+  return String(value || 'file')
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+    .replace(/\s+/g, '_')
+    .slice(0, 120);
+}
 
+function getLithuaniaTodayDate() {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'Europe/Vilnius',
     year: 'numeric',
     month: '2-digit',
-    day: '2-digit',
-  }).formatToParts(now);
+    day: '2-digit'
+  }).formatToParts(new Date());
 
   const year = parts.find((p) => p.type === 'year')?.value;
   const month = parts.find((p) => p.type === 'month')?.value;
@@ -68,16 +75,20 @@ function getLithuaniaTodayDate() {
 }
 
 function normalizeDateValue(value, fallbackDate) {
-  const compact = String(value ?? '').replace(/\s+/g, '').trim();
+  const raw = String(value ?? '').trim();
 
-  if (/^\d{4}-\d{2}-\d{2}$/.test(compact)) {
-    return compact;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    return raw;
   }
 
-  const digitsOnly = compact.replace(/[^\d]/g, '');
+  const digitsOnly = raw.replace(/[^\d]/g, '');
 
   if (digitsOnly.length === 8) {
-    return `${digitsOnly.slice(0, 4)}-${digitsOnly.slice(4, 6)}-${digitsOnly.slice(6, 8)}`;
+    if (digitsOnly.startsWith('20')) {
+      return `${digitsOnly.slice(0, 4)}-${digitsOnly.slice(4, 6)}-${digitsOnly.slice(6, 8)}`;
+    }
+
+    return `${digitsOnly.slice(4, 8)}-${digitsOnly.slice(2, 4)}-${digitsOnly.slice(0, 2)}`;
   }
 
   return fallbackDate || getLithuaniaTodayDate();
@@ -103,7 +114,7 @@ function getVetCredentialsFromBody(body) {
       normalizeValue(body.vetPassword) ||
       normalizeValue(vet.vic_password) ||
       normalizeValue(vet.vicPassword) ||
-      normalizeValue(vet.password),
+      normalizeValue(vet.password)
   };
 }
 
@@ -138,146 +149,19 @@ function normalizeFarmInput(farm, defaultVetCredentials, defaultSearchDate) {
     search_date: normalizeDateValue(
       farm.search_date || farm.searchDate || defaultSearchDate,
       getLithuaniaTodayDate()
-    ),
+    )
   };
 }
 
 async function getBrowser() {
   if (!browser) {
-    browser = await chromium.launch({ headless: HEADLESS });
+    browser = await chromium.launch({
+      headless: HEADLESS,
+      args: ['--disable-dev-shm-usage']
+    });
   }
 
   return browser;
-}
-
-async function uploadToSupabase(localPath, storagePath) {
-  const fileBuffer = await fs.readFile(localPath);
-
-  console.log(
-    `[supabase] uploading bucket=${STORAGE_BUCKET} path=${storagePath} bytes=${fileBuffer.length}`
-  );
-
-  const { data, error } = await supabase.storage
-    .from(STORAGE_BUCKET)
-    .upload(storagePath, fileBuffer, {
-      contentType: 'application/pdf',
-      upsert: true,
-    });
-
-  if (error) {
-    console.error('[supabase] upload error raw:', error);
-
-    throw new Error(
-      `Supabase upload failed: ${error.message || JSON.stringify(error)} | bucket=${STORAGE_BUCKET} | path=${storagePath}`
-    );
-  }
-
-  return data;
-}
-
-async function createSignedUrl(storagePath) {
-  console.log(
-    `[supabase] creating signed url bucket=${STORAGE_BUCKET} path=${storagePath}`
-  );
-
-  const { data, error } = await supabase.storage
-    .from(STORAGE_BUCKET)
-    .createSignedUrl(storagePath, 3600);
-
-  if (error) {
-    console.error('[supabase] signed url error raw:', error);
-
-    throw new Error(
-      `Supabase signed URL failed: ${error.message || JSON.stringify(error)} | bucket=${STORAGE_BUCKET} | path=${storagePath}`
-    );
-  }
-
-  return data.signedUrl;
-}
-
-async function insertRun(runId, farm) {
-  try {
-    const { error } = await supabase.from('vic_download_runs').insert({
-      id: runId,
-      farm_id: farm.id,
-      farm_name: farm.name,
-      vic_username: farm.vic_username,
-      status: 'running',
-    });
-
-    if (error) {
-      console.error('[insertRun] Supabase error:', error);
-    }
-  } catch (err) {
-    console.error('[insertRun] fatal:', err.message || err);
-  }
-}
-
-async function updateRunSuccess(runId, storagePath) {
-  try {
-    const { error } = await supabase
-      .from('vic_download_runs')
-      .update({
-        status: 'success',
-        storage_path: storagePath,
-        finished_at: new Date().toISOString(),
-        error_message: null,
-      })
-      .eq('id', runId);
-
-    if (error) {
-      console.error('[updateRunSuccess] Supabase error:', error);
-    }
-  } catch (err) {
-    console.error('[updateRunSuccess] fatal:', err.message || err);
-  }
-}
-
-async function updateRunFailed(runId, errorMessage) {
-  try {
-    const { error } = await supabase
-      .from('vic_download_runs')
-      .update({
-        status: 'failed',
-        finished_at: new Date().toISOString(),
-        error_message: errorMessage,
-      })
-      .eq('id', runId);
-
-    if (error) {
-      console.error('[updateRunFailed] Supabase error:', error);
-    }
-  } catch (err) {
-    console.error('[updateRunFailed] fatal:', err.message || err);
-  }
-}
-
-async function insertVicFile({ farmId, runId, storagePath, fileName }) {
-  try {
-    const { error } = await supabase.from('vic_files').insert({
-      farm_id: farmId,
-      run_id: runId,
-      bucket: STORAGE_BUCKET,
-      storage_path: storagePath,
-      file_name: fileName,
-    });
-
-    if (error) {
-      console.error('[insertVicFile] Supabase error:', error);
-    }
-  } catch (err) {
-    console.error('[insertVicFile] fatal:', err.message || err);
-  }
-}
-
-async function safeScreenshot(page, tmpDir, farmId, runId) {
-  try {
-    const shotPath = path.join(tmpDir, `${farmId || 'unknown'}-${runId}-error.png`);
-    await page.screenshot({ path: shotPath, fullPage: true });
-    return shotPath;
-  } catch {
-    return null;
-  }
 }
 
 async function getBodyTextPreview(page) {
@@ -290,148 +174,37 @@ async function getBodyTextPreview(page) {
   }
 }
 
-async function detectNoRecords(page) {
-  const bodyText = await getBodyTextPreview(page);
+async function safeScreenshot(page, tmpDir, farmId, runId) {
+  try {
+    const screenshotPath = path.join(
+      tmpDir,
+      `${fileSafe(farmId || 'unknown')}-${runId}-error.png`
+    );
 
-  const noRecords =
-    (bodyText || '').includes('Pagal pasirinktus paieškos kriterijus įrašų nerasta') ||
-    (bodyText || '').includes('įrašų nerasta') ||
-    (bodyText || '').includes('Duomenų nėra') ||
-    (bodyText || '').includes('duomenų nėra') ||
-    (bodyText || '').includes('Nėra duomenų') ||
-    (bodyText || '').includes('nėra duomenų') ||
-    (bodyText || '').includes('Nerasta') ||
-    (bodyText || '').includes('nerasta');
+    await page.screenshot({
+      path: screenshotPath,
+      fullPage: true
+    });
 
-  return {
-    noRecords,
-    bodyText,
-  };
-}
-
-async function detectLoadedResults(page) {
-  const bodyText = await getBodyTextPreview(page);
-
-  const hasHolder =
-    (bodyText || '').includes('Laikytojas') &&
-    (bodyText || '').includes('Asmens/įmonės kodas');
-
-  const hasHerd =
-    (bodyText || '').includes('Banda') &&
-    (bodyText || '').includes('Rūšis');
-
-  const hasSummary =
-    (bodyText || '').includes('Iš viso ataskaitoje') ||
-    (bodyText || '').includes('Iš viso:');
-
-  return {
-    hasResults: hasHolder || hasHerd || hasSummary,
-    bodyText,
-  };
-}
-
-async function getPdfButtonState(page) {
-  const pdfButton = page.locator('#printBtn').first();
-
-  const exists = (await pdfButton.count().catch(() => 0)) > 0;
-
-  if (!exists) {
-    return {
-      exists: false,
-      visible: false,
-    };
-  }
-
-  const visible = await pdfButton
-    .evaluate((el) => {
-      const style = window.getComputedStyle(el);
-
-      return (
-        el.offsetParent !== null &&
-        style.display !== 'none' &&
-        style.visibility !== 'hidden'
-      );
-    })
-    .catch(() => false);
-
-  return {
-    exists,
-    visible,
-  };
-}
-
-async function fillInputAndTriggerEvents(page, selector, value) {
-  const locator = page.locator(selector);
-
-  await locator.waitFor({
-    state: 'visible',
-    timeout: 30000,
-  });
-
-  await locator.click({ timeout: 30000 });
-  await locator.fill('');
-  await locator.fill(String(value));
-
-  await locator.evaluate((el) => {
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    el.dispatchEvent(new Event('blur', { bubbles: true }));
-  });
-
-  await page.waitForTimeout(400);
-}
-
-async function fillClientCode(page, code) {
-  const locator = page.locator('#AsmKodas');
-
-  await locator.waitFor({
-    state: 'visible',
-    timeout: 30000,
-  });
-
-  await locator.click({ timeout: 30000 });
-  await locator.fill('');
-  await locator.type(String(code), { delay: 25 });
-
-  await page.waitForTimeout(700);
-
-  await locator.evaluate((el) => {
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-  });
-
-  await locator.press('Enter').catch(() => null);
-  await page.waitForTimeout(600);
-
-  await locator.press('Tab').catch(() => null);
-  await page.waitForTimeout(700);
-
-  await locator.evaluate((el) => {
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-    el.dispatchEvent(new Event('blur', { bubbles: true }));
-  });
-
-  const actual = await locator.inputValue().catch(() => '');
-  const expectedClean = String(code).replace(/\s+/g, '');
-  const actualClean = String(actual).replace(/\s+/g, '');
-
-  if (!actualClean || actualClean !== expectedClean) {
-    throw new Error(`AsmKodas did not fill correctly. expected=${code} actual=${actual}`);
+    return screenshotPath;
+  } catch {
+    return null;
   }
 }
 
 async function fillLoginField(page, selector, value) {
-  const locator = page.locator(selector);
+  const locator = page.locator(selector).first();
 
   await locator.waitFor({
     state: 'visible',
-    timeout: 30000,
+    timeout: 30000
   });
 
   await locator.click({ timeout: 30000 });
 
   await page.keyboard.press('Control+A').catch(() => null);
   await page.keyboard.press('Meta+A').catch(() => null);
+  await page.keyboard.press('Backspace').catch(() => null);
 
   await locator.fill('');
   await locator.type(String(value), { delay: 35 });
@@ -450,40 +223,39 @@ async function fillLoginField(page, selector, value) {
 }
 
 async function waitForLoginResult(page) {
-  return await page.waitForFunction(
-    () => {
-      const bodyText = document.body.innerText || '';
+  await page
+    .waitForFunction(
+      () => {
+        const bodyText = document.body.innerText || '';
 
-      const hasGpsasLink =
-        !!document.querySelector(
-          '#ctl00_RptMenu_ctl05_CtlMenuNode_RptMenu_ctl00_ctl00_HplMenu'
-        ) ||
-        Array.from(document.querySelectorAll('a')).some((a) => {
-          const href = a.href || '';
-          const text = a.textContent || '';
+        const hasGpsasLink =
+          Array.from(document.querySelectorAll('a')).some((a) => {
+            const href = a.href || '';
+            const text = a.textContent || '';
 
-          return (
-            href.includes('/GPSAS') ||
-            text.includes('Ūkinių gyvūnų registras')
-          );
-        });
+            return (
+              href.includes('/GPSAS') ||
+              text.includes('Ūkinių gyvūnų registras')
+            );
+          });
 
-      const stillOnLogin =
-        !!document.querySelector('#ctl00_PublicPlaceHolder_UserName') ||
-        !!document.querySelector('#ctl00_PublicPlaceHolder_Password');
+        const stillOnLogin =
+          !!document.querySelector('#ctl00_PublicPlaceHolder_UserName') ||
+          !!document.querySelector('#ctl00_PublicPlaceHolder_Password');
 
-      const hasLoginError =
-        bodyText.includes('Būtinas laukas') ||
-        bodyText.includes('Neteisingas') ||
-        bodyText.includes('neteisingas') ||
-        bodyText.includes('Nepavyko') ||
-        bodyText.includes('Klaida');
+        const hasLoginError =
+          bodyText.includes('Būtinas laukas') ||
+          bodyText.includes('Neteisingas') ||
+          bodyText.includes('neteisingas') ||
+          bodyText.includes('Nepavyko') ||
+          bodyText.includes('Klaida');
 
-      return hasGpsasLink || (stillOnLogin && hasLoginError);
-    },
-    null,
-    { timeout: 60000 }
-  );
+        return hasGpsasLink || (stillOnLogin && hasLoginError);
+      },
+      null,
+      { timeout: 60000 }
+    )
+    .catch(() => null);
 }
 
 async function loginToVic(page, vicUsername, vicPassword) {
@@ -494,7 +266,7 @@ async function loginToVic(page, vicUsername, vicPassword) {
 
     await page.goto(VIC_LOGIN_URL, {
       waitUntil: 'domcontentloaded',
-      timeout: 60000,
+      timeout: 60000
     });
 
     await page.waitForTimeout(800);
@@ -525,10 +297,6 @@ async function loginToVic(page, vicUsername, vicPassword) {
       .inputValue()
       .catch(() => '');
 
-    console.log(
-      `[loginToVic] usernameFilled=${!!usernameValue} passwordFilled=${!!passwordValue}`
-    );
-
     if (!usernameValue || !passwordValue) {
       if (attempt === maxAttempts) {
         throw new Error('Login fields were empty before submit.');
@@ -540,33 +308,27 @@ async function loginToVic(page, vicUsername, vicPassword) {
 
     await Promise.all([
       page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => null),
-      page.locator('#ctl00_PublicPlaceHolder_LoginButton').click(),
+      page.locator('#ctl00_PublicPlaceHolder_LoginButton').click()
     ]);
 
     await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
-    await waitForLoginResult(page).catch(() => null);
+    await waitForLoginResult(page);
 
     const bodyText = await getBodyTextPreview(page);
     const currentUrl = page.url();
 
-    const gpsasLinkCount = await page
-      .locator(
-        '#ctl00_RptMenu_ctl05_CtlMenuNode_RptMenu_ctl00_ctl00_HplMenu, a[href="https://ise.vic.lt/GPSAS"], a[href*="/GPSAS"]'
-      )
-      .count()
-      .catch(() => 0);
-
     const loggedIn =
       currentUrl.includes('/GPSAS') ||
       (bodyText || '').includes('Ūkinių gyvūnų registras') ||
-      gpsasLinkCount > 0;
+      (bodyText || '').includes('Registravimas') ||
+      (bodyText || '').includes('Ataskaitos');
 
     if (loggedIn) {
       console.log('[loginToVic] login success');
       return;
     }
 
-    console.log(`[loginToVic] login not confirmed, currentUrl=${currentUrl}`);
+    console.log(`[loginToVic] login not confirmed. URL=${currentUrl}`);
     console.log(`[loginToVic] body preview: ${(bodyText || '').slice(0, 500)}`);
 
     if (attempt === maxAttempts) {
@@ -580,117 +342,277 @@ async function loginToVic(page, vicUsername, vicPassword) {
 }
 
 async function openLiveAnimalsPage(page) {
-  const currentUrl = page.url();
-  const bodyText = await getBodyTextPreview(page);
-
-  const alreadyInsideGpsas =
-    currentUrl.includes('/GPSAS') ||
-    (bodyText || '').includes('Ūkinių gyvūnų registras');
-
-  if (!alreadyInsideGpsas) {
-    const gpsasLink = page
-      .locator(
-        '#ctl00_RptMenu_ctl05_CtlMenuNode_RptMenu_ctl00_ctl00_HplMenu, a[href="https://ise.vic.lt/GPSAS"], a[href*="/GPSAS"]'
-      )
-      .first();
-
-    await gpsasLink.waitFor({
-      state: 'visible',
-      timeout: 60000,
-    });
-
-    await Promise.all([
-      page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => null),
-      gpsasLink.click(),
-    ]);
-
-    await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
-  }
-
   await page.goto(LIVE_ANIMALS_URL, {
     waitUntil: 'domcontentloaded',
-    timeout: 60000,
+    timeout: 60000
   });
 
   await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
 
   await page.locator('#AsmKodas').waitFor({
     state: 'visible',
-    timeout: 60000,
+    timeout: 60000
   });
 }
 
-async function waitForSearchResultOrState(page) {
-  return await page.waitForFunction(
-    () => {
-      const bodyText = document.body.innerText || '';
+async function fillInputAndTriggerEvents(page, selector, value) {
+  const locator = page.locator(selector).first();
 
-      const pdfButton = document.querySelector('#printBtn');
+  await locator.waitFor({
+    state: 'visible',
+    timeout: 30000
+  });
 
-      const hasVisiblePdfButton =
-        !!pdfButton &&
-        pdfButton.offsetParent !== null &&
-        window.getComputedStyle(pdfButton).display !== 'none' &&
-        window.getComputedStyle(pdfButton).visibility !== 'hidden';
+  await locator.click({ timeout: 30000 });
 
-      const hasHolder =
-        bodyText.includes('Laikytojas') &&
-        bodyText.includes('Asmens/įmonės kodas');
+  await page.keyboard.press('Control+A').catch(() => null);
+  await page.keyboard.press('Meta+A').catch(() => null);
+  await page.keyboard.press('Backspace').catch(() => null);
 
-      const hasHerd =
-        bodyText.includes('Banda') &&
-        bodyText.includes('Rūšis');
+  await locator.fill('');
+  await locator.type(String(value), { delay: 35 });
 
-      const hasSummary =
-        bodyText.includes('Iš viso ataskaitoje') ||
-        bodyText.includes('Iš viso:');
+  await locator.evaluate((el) => {
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.dispatchEvent(new Event('blur', { bubbles: true }));
+  });
 
-      const hasNoDataMessage =
-        bodyText.includes('Pagal pasirinktus paieškos kriterijus įrašų nerasta') ||
-        bodyText.includes('įrašų nerasta') ||
-        bodyText.includes('Duomenų nėra') ||
-        bodyText.includes('duomenų nėra') ||
-        bodyText.includes('Nerasta') ||
-        bodyText.includes('nerasta') ||
-        bodyText.includes('Nėra duomenų') ||
-        bodyText.includes('nėra duomenų');
+  await page.waitForTimeout(500);
 
-      const hasValidationMessage =
-        bodyText.includes('Privalomas') ||
-        bodyText.includes('privalomas') ||
-        bodyText.includes('Įveskite') ||
-        bodyText.includes('įveskite') ||
-        bodyText.includes('Neteisingas') ||
-        bodyText.includes('neteisingas');
+  const actualValue = await locator.inputValue().catch(() => '');
 
-      return (
-        hasVisiblePdfButton ||
-        hasHolder ||
-        hasHerd ||
-        hasSummary ||
-        hasNoDataMessage ||
-        hasValidationMessage
-      );
-    },
-    null,
-    { timeout: 90000 }
+  if (!actualValue) {
+    throw new Error(`Input did not fill correctly: ${selector}`);
+  }
+
+  return actualValue;
+}
+
+async function fillClientCode(page, code) {
+  const cleanCode = normalizeCompact(code);
+
+  if (!cleanCode) {
+    throw new Error('Missing client personal/company code.');
+  }
+
+  const locator = page.locator('#AsmKodas').first();
+
+  await locator.waitFor({
+    state: 'visible',
+    timeout: 30000
+  });
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    console.log(`[fillClientCode] attempt ${attempt}, code=${cleanCode}`);
+
+    await locator.click({ timeout: 30000 });
+
+    await page.keyboard.press('Control+A').catch(() => null);
+    await page.keyboard.press('Meta+A').catch(() => null);
+    await page.keyboard.press('Backspace').catch(() => null);
+
+    await locator.fill('');
+    await locator.type(cleanCode, { delay: 55 });
+
+    await page.waitForTimeout(1000);
+
+    await locator.evaluate((el) => {
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+
+    // VIC often needs keyboard confirmation/autocomplete-like behavior.
+    await locator.press('Enter').catch(() => null);
+    await page.waitForTimeout(700);
+
+    await locator.press('Tab').catch(() => null);
+    await page.waitForTimeout(800);
+
+    await locator.evaluate((el) => {
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      el.dispatchEvent(new Event('blur', { bubbles: true }));
+    });
+
+    await page.waitForTimeout(700);
+
+    const actual = normalizeCompact(await locator.inputValue().catch(() => ''));
+
+    console.log(`[fillClientCode] actual=${actual}`);
+
+    if (actual === cleanCode) {
+      return actual;
+    }
+  }
+
+  const actualValue = await locator.inputValue().catch(() => '');
+
+  throw new Error(
+    `AsmKodas did not fill correctly. expected=${cleanCode}, actual=${actualValue}`
   );
 }
 
 async function clickSearch(page) {
   const searchButton = page
-    .locator('#searchBtn, button:has-text("Ieškoti")')
+    .locator('#searchBtn, button:has-text("Ieškoti"), input[value="Ieškoti"]')
     .first();
 
   await searchButton.waitFor({
     state: 'visible',
-    timeout: 30000,
+    timeout: 30000
   });
 
   await Promise.all([
     page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null),
-    searchButton.click(),
+    searchButton.click()
   ]);
+
+  await page.waitForTimeout(4000);
+}
+
+async function waitForSearchResultOrState(page) {
+  await page
+    .waitForFunction(
+      () => {
+        const bodyText = document.body.innerText || '';
+
+        const pdfButton = document.querySelector('#printBtn');
+
+        const hasVisiblePdfButton =
+          !!pdfButton &&
+          pdfButton.offsetParent !== null &&
+          window.getComputedStyle(pdfButton).display !== 'none' &&
+          window.getComputedStyle(pdfButton).visibility !== 'hidden';
+
+        const hasResults =
+          bodyText.includes('Laikytojas') ||
+          bodyText.includes('Banda') ||
+          bodyText.includes('Rūšis') ||
+          bodyText.includes('Iš viso ataskaitoje') ||
+          bodyText.includes('Iš viso:');
+
+        const hasNoDataMessage =
+          bodyText.includes('Pagal pasirinktus paieškos kriterijus įrašų nerasta') ||
+          bodyText.includes('įrašų nerasta') ||
+          bodyText.includes('Duomenų nėra') ||
+          bodyText.includes('duomenų nėra') ||
+          bodyText.includes('Nerasta') ||
+          bodyText.includes('nerasta') ||
+          bodyText.includes('Nėra duomenų') ||
+          bodyText.includes('nėra duomenų');
+
+        const hasValidationMessage =
+          bodyText.includes('Privalomas') ||
+          bodyText.includes('privalomas') ||
+          bodyText.includes('Įveskite') ||
+          bodyText.includes('įveskite') ||
+          bodyText.includes('Neteisingas') ||
+          bodyText.includes('neteisingas');
+
+        return (
+          hasVisiblePdfButton ||
+          hasResults ||
+          hasNoDataMessage ||
+          hasValidationMessage
+        );
+      },
+      null,
+      { timeout: 90000 }
+    )
+    .catch(() => null);
+
+  await page.waitForTimeout(1500);
+}
+
+async function detectNoRecords(page) {
+  const preview = await getBodyTextPreview(page);
+
+  const noRecords =
+    (preview || '').includes('Pagal pasirinktus paieškos kriterijus įrašų nerasta') ||
+    (preview || '').includes('įrašų nerasta') ||
+    (preview || '').includes('Duomenų nėra') ||
+    (preview || '').includes('duomenų nėra') ||
+    (preview || '').includes('Nėra duomenų') ||
+    (preview || '').includes('nėra duomenų') ||
+    (preview || '').includes('Nerasta') ||
+    (preview || '').includes('nerasta');
+
+  return {
+    noRecords,
+    bodyText: preview
+  };
+}
+
+async function detectLoadedResults(page) {
+  const preview = await getBodyTextPreview(page);
+
+  const hasHolder =
+    (preview || '').includes('Laikytojas') &&
+    (preview || '').includes('Asmens/įmonės kodas');
+
+  const hasHerd =
+    (preview || '').includes('Banda') &&
+    (preview || '').includes('Rūšis');
+
+  const hasSummary =
+    (preview || '').includes('Iš viso ataskaitoje') ||
+    (preview || '').includes('Iš viso:');
+
+  return {
+    hasResults: hasHolder || hasHerd || hasSummary,
+    bodyText: preview
+  };
+}
+
+async function getPdfButtonState(page) {
+  const pdfButton = page.locator('#printBtn').first();
+
+  const exists = (await pdfButton.count().catch(() => 0)) > 0;
+
+  if (!exists) {
+    return {
+      exists: false,
+      visible: false
+    };
+  }
+
+  const visible = await pdfButton
+    .evaluate((el) => {
+      const style = window.getComputedStyle(el);
+
+      return (
+        el.offsetParent !== null &&
+        style.display !== 'none' &&
+        style.visibility !== 'hidden'
+      );
+    })
+    .catch(() => false);
+
+  return {
+    exists,
+    visible
+  };
+}
+
+async function runSearchAndInspect(page) {
+  await clickSearch(page);
+  await waitForSearchResultOrState(page);
+
+  const noRecordCheck = await detectNoRecords(page);
+  const resultCheck = await detectLoadedResults(page);
+  const pdfState = await getPdfButtonState(page);
+
+  const bodyText =
+    resultCheck.bodyText ||
+    noRecordCheck.bodyText ||
+    (await getBodyTextPreview(page));
+
+  return {
+    noRecordCheck,
+    resultCheck,
+    pdfState,
+    bodyText
+  };
 }
 
 async function downloadPdf(page) {
@@ -715,15 +637,15 @@ async function downloadPdf(page) {
     .catch(() => false);
 
   if (!visible) {
-    const bodyText = await getBodyTextPreview(page);
+    const preview = await getBodyTextPreview(page);
 
     throw new Error(
-      `PDF button #printBtn exists but is hidden. Preview: ${(bodyText || '').slice(0, 700)}`
+      `PDF button #printBtn exists but is hidden. Preview: ${(preview || '').slice(0, 700)}`
     );
   }
 
   const downloadPromise = page.waitForEvent('download', {
-    timeout: 90000,
+    timeout: 90000
   });
 
   await pdfButton.click();
@@ -731,126 +653,84 @@ async function downloadPdf(page) {
   return await downloadPromise;
 }
 
-async function runSearchAndInspect(page, farm, runId) {
-  console.log(`[${runId}] Clicking search`);
-  await clickSearch(page);
-
-  await page.waitForTimeout(5000);
-
-  await waitForSearchResultOrState(page);
-
-  await page.waitForTimeout(1500);
-
-  const noRecordCheck = await detectNoRecords(page);
-  const resultCheck = await detectLoadedResults(page);
-  const pdfState = await getPdfButtonState(page);
-
-  const bodyText =
-    resultCheck.bodyText ||
-    noRecordCheck.bodyText ||
-    (await getBodyTextPreview(page));
-
-  console.log(
-    `[${runId}] search inspected noRecords=${noRecordCheck.noRecords} hasResults=${resultCheck.hasResults} pdfExists=${pdfState.exists} pdfVisible=${pdfState.visible}`
-  );
-
-  return {
-    noRecordCheck,
-    resultCheck,
-    pdfState,
-    bodyText,
-  };
-}
-
-async function processOneFarm(farm) {
-  const browser = await getBrowser();
-
-  const context = await browser.newContext({
-    acceptDownloads: true,
-    viewport: {
-      width: 1600,
-      height: 1000,
-    },
-  });
-
-  const page = await context.newPage();
-
-  const tmpDir = '/tmp/vic';
-  await fs.mkdir(tmpDir, { recursive: true });
-
+async function processFarmToPdf(farm) {
   const runId = crypto.randomUUID();
   const startedAt = new Date().toISOString();
 
-  if (!farm.id) {
-    await context.close().catch(() => null);
+  const tmpDir = '/tmp/vic-pdfs';
+  await fs.mkdir(tmpDir, { recursive: true });
 
+  const resultBase = {
+    run_id: runId,
+    farm_id: farm.id,
+    farm_name: farm.name,
+    client_personal_code: farm.client_personal_code,
+    search_date: farm.search_date,
+    vic_username: farm.vic_username,
+    started_at: startedAt
+  };
+
+  if (!farm.id) {
     return {
+      ...resultBase,
       success: false,
       stage: 'validation',
-      error: 'Missing farm id.',
-      run_id: runId,
+      error: 'Missing farm id.'
     };
   }
 
   if (!farm.vic_username || !farm.vic_password) {
-    await context.close().catch(() => null);
-
     return {
-      farm_id: farm.id,
-      farm_name: farm.name,
+      ...resultBase,
       success: false,
       stage: 'validation',
-      error: 'Missing vet VIC credentials.',
-      run_id: runId,
+      error: 'Missing VIC credentials.'
     };
   }
 
   if (!farm.client_personal_code) {
-    await context.close().catch(() => null);
-
     return {
-      farm_id: farm.id,
-      farm_name: farm.name,
+      ...resultBase,
       success: false,
       stage: 'validation',
-      error: 'Missing client_personal_code for #AsmKodas.',
-      run_id: runId,
+      error: 'Missing client_personal_code.'
     };
   }
 
-  let currentUrl = null;
-  let localPath = null;
+  const b = await getBrowser();
+
+  const context = await b.newContext({
+    acceptDownloads: true,
+    viewport: {
+      width: 1600,
+      height: 1000
+    }
+  });
+
+  const page = await context.newPage();
+
   let stage = 'started';
-  let bodyTextPreviewAfterSearch = null;
+  let localPath = null;
 
   try {
-    stage = 'insert_run';
-    await insertRun(runId, farm);
-
     stage = 'login';
-    console.log(`[${runId}] Logging into VIC as ${farm.vic_username}`);
+    console.log(`[${runId}] Login as ${farm.vic_username}`);
     await loginToVic(page, farm.vic_username, farm.vic_password);
 
     stage = 'open_live_animals_page';
-    console.log(`[${runId}] Opening live animals page`);
+    console.log(`[${runId}] Open live animals page`);
     await openLiveAnimalsPage(page);
 
     stage = 'fill_client_code';
-    console.log(`[${runId}] Filling client code ${farm.client_personal_code}`);
+    console.log(`[${runId}] Fill client code ${farm.client_personal_code}`);
     await fillClientCode(page, farm.client_personal_code);
 
-    await page.waitForTimeout(700);
-
     stage = 'fill_search_date';
-    console.log(`[${runId}] Filling search date ${farm.search_date}`);
+    console.log(`[${runId}] Fill search date ${farm.search_date}`);
     await fillInputAndTriggerEvents(page, '#PaieskosData', farm.search_date);
 
-    stage = 'press_enter_date';
-    await page.locator('#PaieskosData').press('Enter');
+    await page.locator('#PaieskosData').press('Enter').catch(() => null);
 
-    await page.waitForTimeout(500);
-
-    stage = 'click_h4_blur';
     await page
       .locator('h4:has-text("Gyvų gyvūnų sąrašas")')
       .click()
@@ -858,23 +738,20 @@ async function processOneFarm(farm) {
 
     await page.waitForTimeout(500);
 
-    stage = 'wait_for_search_result';
+    stage = 'search';
+    let inspection = await runSearchAndInspect(page);
 
-    let inspection = await runSearchAndInspect(page, farm, runId);
-
-    // Retry once if VIC did not load results and did not show no-record message.
+    // Retry once if VIC did not clearly load results.
     if (
       !inspection.noRecordCheck.noRecords &&
       !inspection.resultCheck.hasResults &&
       !inspection.pdfState.visible
     ) {
-      console.log(`[${runId}] No clear result after first search, retrying once`);
+      console.log(`[${runId}] unclear result, retrying once`);
 
-      await page.waitForTimeout(1200);
+      await page.waitForTimeout(1500);
 
       await fillClientCode(page, farm.client_personal_code);
-      await page.waitForTimeout(700);
-
       await fillInputAndTriggerEvents(page, '#PaieskosData', farm.search_date);
       await page.locator('#PaieskosData').press('Enter').catch(() => null);
 
@@ -885,136 +762,81 @@ async function processOneFarm(farm) {
 
       await page.waitForTimeout(800);
 
-      inspection = await runSearchAndInspect(page, farm, runId);
+      inspection = await runSearchAndInspect(page);
     }
 
-    bodyTextPreviewAfterSearch = inspection.bodyText;
+    const bodyTextPreview =
+      inspection.bodyText ||
+      inspection.noRecordCheck.bodyText ||
+      (await getBodyTextPreview(page));
 
     if (inspection.noRecordCheck.noRecords) {
-      stage = 'no_records_found';
-
-      await updateRunFailed(
-        runId,
-        `[${stage}] No records found for client_personal_code=${farm.client_personal_code}`
-      );
-
-      currentUrl = page.url();
-
       await context.close().catch(() => null);
 
       return {
-        farm_id: farm.id,
-        farm_name: farm.name,
-        client_personal_code: farm.client_personal_code,
-        search_date: farm.search_date,
-        vic_username: farm.vic_username,
+        ...resultBase,
         success: false,
-        stage,
+        stage: 'no_records_found',
         error: 'No records found for selected search criteria.',
-        current_url: currentUrl,
-        body_text_preview_after_search: bodyTextPreviewAfterSearch,
-        run_id: runId,
+        current_url: page.url(),
+        body_text_preview_after_search: (bodyTextPreview || '').slice(0, 3000),
+        finished_at: new Date().toISOString()
       };
     }
 
     if (!inspection.pdfState.visible) {
-      stage = 'no_pdf_available';
-
-      await updateRunFailed(
-        runId,
-        `[${stage}] PDF button hidden or unavailable. hasResults=${inspection.resultCheck.hasResults}, pdfExists=${inspection.pdfState.exists}`
-      );
-
-      currentUrl = page.url();
+      const shotPath = await safeScreenshot(page, tmpDir, farm.id, runId);
 
       await context.close().catch(() => null);
 
       return {
-        farm_id: farm.id,
-        farm_name: farm.name,
-        client_personal_code: farm.client_personal_code,
-        search_date: farm.search_date,
-        vic_username: farm.vic_username,
+        ...resultBase,
         success: false,
-        stage,
-        error: `PDF button hidden or unavailable. hasResults=${inspection.resultCheck.hasResults}, pdfExists=${inspection.pdfState.exists}`,
-        current_url: currentUrl,
-        body_text_preview_after_search: bodyTextPreviewAfterSearch,
-        run_id: runId,
+        stage: 'no_pdf_available',
+        error: `PDF button hidden or unavailable. pdfExists=${inspection.pdfState.exists}, hasResults=${inspection.resultCheck.hasResults}`,
+        current_url: page.url(),
+        body_text_preview_after_search: (bodyTextPreview || '').slice(0, 3000),
+        screenshot_path: shotPath,
+        finished_at: new Date().toISOString()
       };
     }
 
     stage = 'download_pdf';
-    console.log(`[${runId}] Downloading PDF`);
-    const download = await downloadPdf(page);
+    console.log(`[${runId}] Download PDF`);
 
-    stage = 'save_pdf_local';
-    const fileName = `live-animals-${farm.client_personal_code}-${farm.search_date}.pdf`;
+    const download = await downloadPdf(page);
+    const suggestedName = download.suggestedFilename();
+
+    const fileName = fileSafe(
+      suggestedName ||
+        `live-animals-${farm.name || farm.id}-${farm.client_personal_code}-${farm.search_date}.pdf`
+    );
 
     localPath = path.join(
       tmpDir,
-      `${farm.id}-${runId}-${fileSafe(fileName)}`
+      `${fileSafe(farm.id)}-${runId}-${fileName.endsWith('.pdf') ? fileName : `${fileName}.pdf`}`
     );
 
     await download.saveAs(localPath);
 
-    const storagePath = `${farm.id}/${farm.search_date}/${fileName}`;
-
-    stage = 'upload_supabase';
-    console.log(`[${runId}] Uploading to Supabase ${storagePath}`);
-    await uploadToSupabase(localPath, storagePath);
-
-    stage = 'create_signed_url';
-    const signedUrl = await createSignedUrl(storagePath);
-
-    stage = 'insert_vic_file';
-    await insertVicFile({
-      farmId: farm.id,
-      runId,
-      storagePath,
-      fileName,
-    });
-
-    stage = 'update_run_success';
-    await updateRunSuccess(runId, storagePath);
-
-    await fs.unlink(localPath).catch(() => null);
-    localPath = null;
-
-    currentUrl = page.url();
+    const stat = await fs.stat(localPath);
 
     await context.close().catch(() => null);
 
     return {
-      farm_id: farm.id,
-      farm_name: farm.name,
-      client_personal_code: farm.client_personal_code,
-      search_date: farm.search_date,
-      vic_username: farm.vic_username,
+      ...resultBase,
       success: true,
       stage: 'done',
-      storage_path: storagePath,
-      file_name: fileName,
-      signed_url: signedUrl,
-      run_id: runId,
-      started_at: startedAt,
-      finished_at: new Date().toISOString(),
-      current_url: currentUrl,
-      body_text_preview_after_search: bodyTextPreviewAfterSearch,
+      file_name: path.basename(localPath),
+      file_path: localPath,
+      file_size: stat.size,
+      current_url: page.url(),
+      finished_at: new Date().toISOString()
     };
   } catch (err) {
     const errorMessage = err.message || String(err);
-
-    try {
-      currentUrl = page.url();
-    } catch {
-      currentUrl = null;
-    }
-
-    const bodyTextPreview = await getBodyTextPreview(page);
+    const bodyTextPreview = await getBodyTextPreview(page).catch(() => null);
     const shotPath = await safeScreenshot(page, tmpDir, farm.id, runId);
-
-    await updateRunFailed(runId, `[${stage}] ${errorMessage}`);
 
     if (localPath) {
       await fs.unlink(localPath).catch(() => null);
@@ -1023,39 +845,179 @@ async function processOneFarm(farm) {
     await context.close().catch(() => null);
 
     return {
-      farm_id: farm.id,
-      farm_name: farm.name,
-      client_personal_code: farm.client_personal_code,
-      search_date: farm.search_date,
-      vic_username: farm.vic_username,
+      ...resultBase,
       success: false,
       stage,
       error: errorMessage,
-      current_url: currentUrl,
-      body_text_preview_after_search: bodyTextPreviewAfterSearch,
-      body_text_preview: bodyTextPreview,
+      current_url: page.url(),
+      body_text_preview: (bodyTextPreview || '').slice(0, 3000),
       screenshot_path: shotPath,
-      run_id: runId,
+      finished_at: new Date().toISOString()
     };
+  }
+}
+
+async function runWithConcurrency(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function runner() {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+
+      results[currentIndex] = await worker(items[currentIndex], currentIndex);
+    }
+  }
+
+  const runners = [];
+
+  const runnerCount = Math.min(concurrency, items.length);
+
+  for (let i = 0; i < runnerCount; i++) {
+    runners.push(runner());
+  }
+
+  await Promise.all(runners);
+
+  return results;
+}
+
+async function createZipFromResults(results, zipPath) {
+  const output = fsSync.createWriteStream(zipPath);
+  const archive = archiver('zip', {
+    zlib: { level: 9 }
+  });
+
+  const finished = new Promise((resolve, reject) => {
+    output.on('close', resolve);
+    archive.on('error', reject);
+  });
+
+  archive.pipe(output);
+
+  const manifest = {
+    ok: true,
+    created_at: new Date().toISOString(),
+    total: results.length,
+    success_count: results.filter((r) => r.success).length,
+    failed_count: results.filter((r) => !r.success).length,
+    results: results.map((r) => ({
+      run_id: r.run_id,
+      farm_id: r.farm_id,
+      farm_name: r.farm_name,
+      client_personal_code: r.client_personal_code,
+      search_date: r.search_date,
+      success: r.success,
+      stage: r.stage,
+      error: r.error || null,
+      file_name: r.zip_file_name || r.file_name || null,
+      file_size: r.file_size || null,
+      current_url: r.current_url || null,
+      body_text_preview: r.body_text_preview || r.body_text_preview_after_search || null,
+      screenshot_path: r.screenshot_path || null,
+      started_at: r.started_at,
+      finished_at: r.finished_at
+    }))
+  };
+
+  archive.append(JSON.stringify(manifest, null, 2), {
+    name: 'manifest.json'
+  });
+
+  for (const result of results) {
+    if (!result.success || !result.file_path) continue;
+
+    const baseName = fileSafe(
+      `${result.farm_name || result.farm_id || 'farm'}-${result.client_personal_code || 'code'}-${result.search_date || 'date'}.pdf`
+    );
+
+    const zipFileName = `pdfs/${baseName.endsWith('.pdf') ? baseName : `${baseName}.pdf`}`;
+
+    result.zip_file_name = zipFileName;
+
+    archive.file(result.file_path, {
+      name: zipFileName
+    });
+  }
+
+  await archive.finalize();
+  await finished;
+}
+
+async function cleanupResultFiles(results) {
+  for (const result of results) {
+    if (result.file_path) {
+      await fs.unlink(result.file_path).catch(() => null);
+    }
   }
 }
 
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
-    version: 'vic-vet-login-client-code-stable-v8',
+    version: 'vic-direct-pdf-zip-v2',
+    max_parallel_contexts: MAX_PARALLEL_CONTEXTS,
+    headless: HEADLESS
   });
 });
 
-app.post('/run-batch', requireInternalAuth, async (req, res) => {
-  try {
-    console.log('[run-batch] incoming body:', JSON.stringify({
-      hasVet: !!req.body.vet,
-      farmCount: Array.isArray(req.body.farms) ? req.body.farms.length : 0,
-      searchDate: req.body.search_date || req.body.searchDate || null,
-    }));
+app.post('/download-live-animals-pdf', requireInternalAuth, async (req, res) => {
+  const defaultVetCredentials = getVetCredentialsFromBody(req.body);
 
+  const defaultSearchDate = normalizeDateValue(
+    req.body.search_date || req.body.searchDate,
+    getLithuaniaTodayDate()
+  );
+
+  const rawFarm = req.body.farm || req.body;
+
+  const farm = normalizeFarmInput(
+    rawFarm,
+    defaultVetCredentials,
+    defaultSearchDate
+  );
+
+  const result = await processFarmToPdf(farm);
+
+  if (!result.success) {
+    return res.status(422).json({
+      ok: false,
+      result
+    });
+  }
+
+  const fileBuffer = await fs.readFile(result.file_path);
+
+  await fs.unlink(result.file_path).catch(() => null);
+
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader(
+    'Content-Disposition',
+    `attachment; filename="${fileSafe(result.file_name || 'live-animals.pdf')}"`
+  );
+  res.setHeader('Content-Length', fileBuffer.length);
+  res.setHeader('X-Farm-Id', result.farm_id || '');
+  res.setHeader('X-Farm-Name', encodeURIComponent(result.farm_name || ''));
+  res.setHeader('X-Client-Personal-Code', result.client_personal_code || '');
+  res.setHeader('X-Search-Date', result.search_date || '');
+
+  return res.send(fileBuffer);
+});
+
+app.post('/download-live-animals-pdfs', requireInternalAuth, async (req, res) => {
+  let zipPath = null;
+  let results = [];
+
+  try {
     const rawFarms = Array.isArray(req.body.farms) ? req.body.farms : [];
+
+    if (rawFarms.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: 'No farms provided. Expected body.farms array.'
+      });
+    }
 
     const defaultVetCredentials = getVetCredentialsFromBody(req.body);
 
@@ -1068,27 +1030,93 @@ app.post('/run-batch', requireInternalAuth, async (req, res) => {
       normalizeFarmInput(farm, defaultVetCredentials, defaultSearchDate)
     );
 
-    const results = [];
+    const requestedConcurrency = Number(req.body.concurrency || MAX_PARALLEL_CONTEXTS);
 
-    for (const farm of farms) {
-      const result = await limit(() => processOneFarm(farm));
-      results.push(result);
-    }
+    const concurrency = Math.max(
+      1,
+      Math.min(requestedConcurrency, MAX_PARALLEL_CONTEXTS, farms.length)
+    );
 
-    return res.json({
-      ok: true,
-      count: results.length,
-      results,
+    console.log(
+      `[download-live-animals-pdfs] farms=${farms.length}, concurrency=${concurrency}`
+    );
+
+    results = await runWithConcurrency(farms, concurrency, async (farm, index) => {
+      console.log(
+        `[batch] ${index + 1}/${farms.length} starting farm=${farm.name} code=${farm.client_personal_code}`
+      );
+
+      const result = await processFarmToPdf(farm);
+
+      console.log(
+        `[batch] ${index + 1}/${farms.length} finished success=${result.success} stage=${result.stage}`
+      );
+
+      return result;
     });
+
+    const zipDir = '/tmp/vic-zips';
+    await fs.mkdir(zipDir, { recursive: true });
+
+    const zipName = `vic-live-animals-${defaultSearchDate}-${Date.now()}.zip`;
+    zipPath = path.join(zipDir, zipName);
+
+    await createZipFromResults(results, zipPath);
+
+    const zipBuffer = await fs.readFile(zipPath);
+
+    await cleanupResultFiles(results);
+    await fs.unlink(zipPath).catch(() => null);
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${zipName}"`
+    );
+    res.setHeader('Content-Length', zipBuffer.length);
+    res.setHeader('X-Total-Farms', String(results.length));
+    res.setHeader('X-Success-Count', String(results.filter((r) => r.success).length));
+    res.setHeader('X-Failed-Count', String(results.filter((r) => !r.success).length));
+
+    return res.send(zipBuffer);
   } catch (err) {
-    console.error('[run-batch] fatal error:', err);
+    console.error('[download-live-animals-pdfs] fatal:', err);
+
+    await cleanupResultFiles(results).catch(() => null);
+
+    if (zipPath) {
+      await fs.unlink(zipPath).catch(() => null);
+    }
 
     return res.status(500).json({
       ok: false,
       error: err.message || String(err),
       stack: err.stack || null,
+      partial_results: results.map((r) => ({
+        farm_id: r.farm_id,
+        farm_name: r.farm_name,
+        success: r.success,
+        stage: r.stage,
+        error: r.error || null
+      }))
     });
   }
+});
+
+process.on('SIGINT', async () => {
+  if (browser) {
+    await browser.close().catch(() => null);
+  }
+
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  if (browser) {
+    await browser.close().catch(() => null);
+  }
+
+  process.exit(0);
 });
 
 app.listen(PORT, () => {
