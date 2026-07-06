@@ -6,18 +6,18 @@ const path = require('path');
 const crypto = require('crypto');
 const archiver = require('archiver');
 
-console.log('SERVER VERSION: vic-direct-pdf-zip-v2');
+console.log('SERVER VERSION: vic-direct-pdf-zip-stream-v2.1');
 
 const app = express();
-app.use(express.json({ limit: '25mb' }));
+app.use(express.json({ limit: '50mb' }));
 
 const PORT = process.env.PORT || 3000;
 const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN;
 const HEADLESS = String(process.env.PLAYWRIGHT_HEADLESS || 'true') === 'true';
 
-// Important: do not set this to 50.
-// 50 farms can be submitted at once, but the worker should process a few in parallel.
-const MAX_PARALLEL_CONTEXTS = Number(process.env.MAX_PARALLEL_CONTEXTS || 4);
+// This is the max parallel Playwright browser contexts.
+// For Render, start with 1 or 2. Do NOT set this to 64.
+const MAX_PARALLEL_CONTEXTS = Number(process.env.MAX_PARALLEL_CONTEXTS || 1);
 
 const VIC_LOGIN_URL = 'https://ise.vic.lt/Public/Login.aspx';
 const LIVE_ANIMALS_URL = 'https://ise.vic.lt/GPSAS/Ataskaitos/GyvuGyvunuSarasas';
@@ -56,7 +56,7 @@ function fileSafe(value) {
   return String(value || 'file')
     .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
     .replace(/\s+/g, '_')
-    .slice(0, 120);
+    .slice(0, 140);
 }
 
 function getLithuaniaTodayDate() {
@@ -422,7 +422,6 @@ async function fillClientCode(page, code) {
       el.dispatchEvent(new Event('change', { bubbles: true }));
     });
 
-    // VIC often needs keyboard confirmation/autocomplete-like behavior.
     await locator.press('Enter').catch(() => null);
     await page.waitForTimeout(700);
 
@@ -702,8 +701,8 @@ async function processFarmToPdf(farm) {
   const context = await b.newContext({
     acceptDownloads: true,
     viewport: {
-      width: 1600,
-      height: 1000
+      width: 1400,
+      height: 900
     }
   });
 
@@ -741,7 +740,6 @@ async function processFarmToPdf(farm) {
     stage = 'search';
     let inspection = await runSearchAndInspect(page);
 
-    // Retry once if VIC did not clearly load results.
     if (
       !inspection.noRecordCheck.noRecords &&
       !inspection.resultCheck.hasResults &&
@@ -807,19 +805,21 @@ async function processFarmToPdf(farm) {
     const download = await downloadPdf(page);
     const suggestedName = download.suggestedFilename();
 
-    const fileName = fileSafe(
+    const finalFileName = fileSafe(
       suggestedName ||
         `live-animals-${farm.name || farm.id}-${farm.client_personal_code}-${farm.search_date}.pdf`
     );
 
     localPath = path.join(
       tmpDir,
-      `${fileSafe(farm.id)}-${runId}-${fileName.endsWith('.pdf') ? fileName : `${fileName}.pdf`}`
+      `${fileSafe(farm.id)}-${runId}-${finalFileName.endsWith('.pdf') ? finalFileName : `${finalFileName}.pdf`}`
     );
 
     await download.saveAs(localPath);
 
     const stat = await fs.stat(localPath);
+
+    const currentUrl = page.url();
 
     await context.close().catch(() => null);
 
@@ -830,7 +830,7 @@ async function processFarmToPdf(farm) {
       file_name: path.basename(localPath),
       file_path: localPath,
       file_size: stat.size,
-      current_url: page.url(),
+      current_url: currentUrl,
       finished_at: new Date().toISOString()
     };
   } catch (err) {
@@ -870,9 +870,8 @@ async function runWithConcurrency(items, concurrency, worker) {
     }
   }
 
-  const runners = [];
-
   const runnerCount = Math.min(concurrency, items.length);
+  const runners = [];
 
   for (let i = 0; i < runnerCount; i++) {
     runners.push(runner());
@@ -883,20 +882,16 @@ async function runWithConcurrency(items, concurrency, worker) {
   return results;
 }
 
-async function createZipFromResults(results, zipPath) {
-  const output = fsSync.createWriteStream(zipPath);
-  const archive = archiver('zip', {
-    zlib: { level: 9 }
-  });
+async function cleanupResultFiles(results) {
+  for (const result of results || []) {
+    if (result?.file_path) {
+      await fs.unlink(result.file_path).catch(() => null);
+    }
+  }
+}
 
-  const finished = new Promise((resolve, reject) => {
-    output.on('close', resolve);
-    archive.on('error', reject);
-  });
-
-  archive.pipe(output);
-
-  const manifest = {
+function buildManifest(results) {
+  return {
     ok: true,
     created_at: new Date().toISOString(),
     total: results.length,
@@ -920,93 +915,99 @@ async function createZipFromResults(results, zipPath) {
       finished_at: r.finished_at
     }))
   };
-
-  archive.append(JSON.stringify(manifest, null, 2), {
-    name: 'manifest.json'
-  });
-
-  for (const result of results) {
-    if (!result.success || !result.file_path) continue;
-
-    const baseName = fileSafe(
-      `${result.farm_name || result.farm_id || 'farm'}-${result.client_personal_code || 'code'}-${result.search_date || 'date'}.pdf`
-    );
-
-    const zipFileName = `pdfs/${baseName.endsWith('.pdf') ? baseName : `${baseName}.pdf`}`;
-
-    result.zip_file_name = zipFileName;
-
-    archive.file(result.file_path, {
-      name: zipFileName
-    });
-  }
-
-  await archive.finalize();
-  await finished;
-}
-
-async function cleanupResultFiles(results) {
-  for (const result of results) {
-    if (result.file_path) {
-      await fs.unlink(result.file_path).catch(() => null);
-    }
-  }
 }
 
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
-    version: 'vic-direct-pdf-zip-v2',
-    max_parallel_contexts: MAX_PARALLEL_CONTEXTS,
-    headless: HEADLESS
+    version: 'vic-direct-pdf-zip-stream-v2.1',
+    headless: HEADLESS,
+    max_parallel_contexts: MAX_PARALLEL_CONTEXTS
   });
 });
 
 app.post('/download-live-animals-pdf', requireInternalAuth, async (req, res) => {
-  const defaultVetCredentials = getVetCredentialsFromBody(req.body);
+  let result = null;
 
-  const defaultSearchDate = normalizeDateValue(
-    req.body.search_date || req.body.searchDate,
-    getLithuaniaTodayDate()
-  );
+  try {
+    const defaultVetCredentials = getVetCredentialsFromBody(req.body);
 
-  const rawFarm = req.body.farm || req.body;
+    const defaultSearchDate = normalizeDateValue(
+      req.body.search_date || req.body.searchDate,
+      getLithuaniaTodayDate()
+    );
 
-  const farm = normalizeFarmInput(
-    rawFarm,
-    defaultVetCredentials,
-    defaultSearchDate
-  );
+    const rawFarm = req.body.farm || req.body;
 
-  const result = await processFarmToPdf(farm);
+    const farm = normalizeFarmInput(
+      rawFarm,
+      defaultVetCredentials,
+      defaultSearchDate
+    );
 
-  if (!result.success) {
-    return res.status(422).json({
+    result = await processFarmToPdf(farm);
+
+    if (!result.success) {
+      return res.status(422).json({
+        ok: false,
+        result
+      });
+    }
+
+    const fileName = fileSafe(result.file_name || 'live-animals.pdf');
+    const stat = await fs.stat(result.file_path);
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${fileName}"`
+    );
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('X-Farm-Id', result.farm_id || '');
+    res.setHeader('X-Farm-Name', encodeURIComponent(result.farm_name || ''));
+    res.setHeader('X-Client-Personal-Code', result.client_personal_code || '');
+    res.setHeader('X-Search-Date', result.search_date || '');
+
+    const stream = fsSync.createReadStream(result.file_path);
+
+    stream.on('close', async () => {
+      if (result?.file_path) {
+        await fs.unlink(result.file_path).catch(() => null);
+      }
+    });
+
+    stream.on('error', async (err) => {
+      console.error('[download-live-animals-pdf] stream error:', err);
+
+      if (result?.file_path) {
+        await fs.unlink(result.file_path).catch(() => null);
+      }
+
+      if (!res.headersSent) {
+        res.status(500).json({
+          ok: false,
+          error: err.message || String(err)
+        });
+      }
+    });
+
+    return stream.pipe(res);
+  } catch (err) {
+    console.error('[download-live-animals-pdf] fatal:', err);
+
+    if (result?.file_path) {
+      await fs.unlink(result.file_path).catch(() => null);
+    }
+
+    return res.status(500).json({
       ok: false,
-      result
+      error: err.message || String(err),
+      stack: err.stack || null
     });
   }
-
-  const fileBuffer = await fs.readFile(result.file_path);
-
-  await fs.unlink(result.file_path).catch(() => null);
-
-  res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader(
-    'Content-Disposition',
-    `attachment; filename="${fileSafe(result.file_name || 'live-animals.pdf')}"`
-  );
-  res.setHeader('Content-Length', fileBuffer.length);
-  res.setHeader('X-Farm-Id', result.farm_id || '');
-  res.setHeader('X-Farm-Name', encodeURIComponent(result.farm_name || ''));
-  res.setHeader('X-Client-Personal-Code', result.client_personal_code || '');
-  res.setHeader('X-Search-Date', result.search_date || '');
-
-  return res.send(fileBuffer);
 });
 
 app.post('/download-live-animals-pdfs', requireInternalAuth, async (req, res) => {
-  let zipPath = null;
   let results = [];
 
   try {
@@ -1055,38 +1056,69 @@ app.post('/download-live-animals-pdfs', requireInternalAuth, async (req, res) =>
       return result;
     });
 
-    const zipDir = '/tmp/vic-zips';
-    await fs.mkdir(zipDir, { recursive: true });
+    for (const result of results) {
+      if (!result.success || !result.file_path) continue;
+
+      const baseName = fileSafe(
+        `${result.farm_name || result.farm_id || 'farm'}-${result.client_personal_code || 'code'}-${result.search_date || 'date'}.pdf`
+      );
+
+      result.zip_file_name = `pdfs/${baseName.endsWith('.pdf') ? baseName : `${baseName}.pdf`}`;
+    }
 
     const zipName = `vic-live-animals-${defaultSearchDate}-${Date.now()}.zip`;
-    zipPath = path.join(zipDir, zipName);
-
-    await createZipFromResults(results, zipPath);
-
-    const zipBuffer = await fs.readFile(zipPath);
-
-    await cleanupResultFiles(results);
-    await fs.unlink(zipPath).catch(() => null);
 
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader(
       'Content-Disposition',
       `attachment; filename="${zipName}"`
     );
-    res.setHeader('Content-Length', zipBuffer.length);
     res.setHeader('X-Total-Farms', String(results.length));
     res.setHeader('X-Success-Count', String(results.filter((r) => r.success).length));
     res.setHeader('X-Failed-Count', String(results.filter((r) => !r.success).length));
 
-    return res.send(zipBuffer);
+    const archive = archiver('zip', {
+      zlib: { level: 1 }
+    });
+
+    archive.on('error', async (err) => {
+      console.error('[zip] archive error:', err);
+
+      await cleanupResultFiles(results).catch(() => null);
+
+      if (!res.headersSent) {
+        res.status(500).json({
+          ok: false,
+          error: err.message || String(err)
+        });
+      } else {
+        res.end();
+      }
+    });
+
+    archive.on('end', async () => {
+      await cleanupResultFiles(results).catch(() => null);
+    });
+
+    archive.pipe(res);
+
+    archive.append(JSON.stringify(buildManifest(results), null, 2), {
+      name: 'manifest.json'
+    });
+
+    for (const result of results) {
+      if (!result.success || !result.file_path) continue;
+
+      archive.file(result.file_path, {
+        name: result.zip_file_name
+      });
+    }
+
+    return archive.finalize();
   } catch (err) {
     console.error('[download-live-animals-pdfs] fatal:', err);
 
     await cleanupResultFiles(results).catch(() => null);
-
-    if (zipPath) {
-      await fs.unlink(zipPath).catch(() => null);
-    }
 
     return res.status(500).json({
       ok: false,
@@ -1101,6 +1133,12 @@ app.post('/download-live-animals-pdfs', requireInternalAuth, async (req, res) =>
       }))
     });
   }
+});
+
+// Backwards-compatible alias if some old n8n node still calls /run-batch.
+app.post('/run-batch', requireInternalAuth, async (req, res) => {
+  req.url = '/download-live-animals-pdfs';
+  return app._router.handle(req, res);
 });
 
 process.on('SIGINT', async () => {
