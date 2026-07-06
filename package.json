@@ -1,15 +1,14 @@
 {
   "name": "vic-render-worker",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.49.1",
+    "archiver": "^7.0.1",
     "express": "^4.21.2",
-    "p-limit": "^6.2.0",
     "playwright": "1.59.1"
   }
 }
