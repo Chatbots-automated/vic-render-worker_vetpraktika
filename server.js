@@ -4,19 +4,15 @@ const fs = require('fs/promises');
 const fsSync = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const archiver = require('archiver');
 
-console.log('SERVER VERSION: vic-batch-pdf-stream-zip-v4');
+console.log('SERVER VERSION: vic-single-pdf-stream-v5-header-safe');
 
 const app = express();
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 3000;
 const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN;
 const HEADLESS = String(process.env.PLAYWRIGHT_HEADLESS || 'true') === 'true';
-
-// Keep this 1 on Render unless you upgrade RAM.
-const MAX_PARALLEL_CONTEXTS = Number(process.env.MAX_PARALLEL_CONTEXTS || 1);
 
 const VIC_LOGIN_URL = 'https://ise.vic.lt/Public/Login.aspx';
 const LIVE_ANIMALS_URL = 'https://ise.vic.lt/GPSAS/Ataskaitos/GyvuGyvunuSarasas';
@@ -51,9 +47,25 @@ function normalizeCompact(value) {
 
 function fileSafe(value) {
   return String(value || 'file')
-    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[<>:"/\\|?*\x00-\x1F\x7F-\x9F]/g, '_')
+    .replace(/[^\x20-\x7E]/g, '_')
     .replace(/\s+/g, '_')
-    .slice(0, 140);
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 140) || 'file';
+}
+
+function buildContentDispositionFileName(originalFileName) {
+  const asciiFileName = fileSafe(originalFileName)
+    .replace(/["\\]/g, '_');
+
+  const encodedFileName = encodeURIComponent(originalFileName)
+    .replace(/['()]/g, escape)
+    .replace(/\*/g, '%2A');
+
+  return `attachment; filename="${asciiFileName}"; filename*=UTF-8''${encodedFileName}`;
 }
 
 function getLithuaniaTodayDate() {
@@ -861,201 +873,12 @@ async function processFarmToPdf(farm) {
   }
 }
 
-async function runWithConcurrency(items, concurrency, worker) {
-  const results = new Array(items.length);
-  let nextIndex = 0;
-
-  async function runner() {
-    while (nextIndex < items.length) {
-      const currentIndex = nextIndex;
-      nextIndex += 1;
-
-      results[currentIndex] = await worker(items[currentIndex], currentIndex);
-    }
-  }
-
-  const runnerCount = Math.min(concurrency, items.length);
-  const runners = [];
-
-  for (let i = 0; i < runnerCount; i++) {
-    runners.push(runner());
-  }
-
-  await Promise.all(runners);
-
-  return results;
-}
-
-async function cleanupResultFiles(results) {
-  for (const result of results || []) {
-    if (result?.file_path) {
-      await fs.unlink(result.file_path).catch(() => null);
-    }
-  }
-}
-
-function buildManifest(results) {
-  return {
-    ok: true,
-    created_at: new Date().toISOString(),
-    total: results.length,
-    success_count: results.filter((r) => r.success).length,
-    failed_count: results.filter((r) => !r.success).length,
-    results: results.map((r) => ({
-      run_id: r.run_id,
-      farm_id: r.farm_id,
-      farm_name: r.farm_name,
-      client_personal_code: r.client_personal_code,
-      search_date: r.search_date,
-      success: r.success,
-      stage: r.stage,
-      error: r.error || null,
-      file_name: r.zip_file_name || r.file_name || null,
-      file_size: r.file_size || null,
-      current_url: r.current_url || null,
-      body_text_preview: r.body_text_preview || r.body_text_preview_after_search || null,
-      screenshot_path: r.screenshot_path || null,
-      started_at: r.started_at,
-      finished_at: r.finished_at
-    }))
-  };
-}
-
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
-    version: 'vic-batch-pdf-stream-zip-v4',
-    headless: HEADLESS,
-    max_parallel_contexts: MAX_PARALLEL_CONTEXTS
+    version: 'vic-single-pdf-stream-v5-header-safe',
+    headless: HEADLESS
   });
-});
-
-app.post('/download-live-animals-pdfs', requireInternalAuth, async (req, res) => {
-  let results = [];
-
-  try {
-    const rawFarms = Array.isArray(req.body.farms) ? req.body.farms : [];
-
-    if (rawFarms.length === 0) {
-      return res.status(400).json({
-        ok: false,
-        error: 'No farms provided. Expected body.farms array.'
-      });
-    }
-
-    const defaultVetCredentials = getVetCredentialsFromBody(req.body);
-
-    const defaultSearchDate = normalizeDateValue(
-      req.body.search_date || req.body.searchDate,
-      getLithuaniaTodayDate()
-    );
-
-    const farms = rawFarms.map((farm) =>
-      normalizeFarmInput(farm, defaultVetCredentials, defaultSearchDate)
-    );
-
-    const requestedConcurrency = Number(req.body.concurrency || MAX_PARALLEL_CONTEXTS);
-
-    const concurrency = Math.max(
-      1,
-      Math.min(requestedConcurrency, MAX_PARALLEL_CONTEXTS, farms.length)
-    );
-
-    console.log(
-      `[download-live-animals-pdfs] farms=${farms.length}, concurrency=${concurrency}`
-    );
-
-    results = await runWithConcurrency(farms, concurrency, async (farm, index) => {
-      console.log(
-        `[batch] ${index + 1}/${farms.length} starting farm=${farm.name} code=${farm.client_personal_code}`
-      );
-
-      const result = await processFarmToPdf(farm);
-
-      console.log(
-        `[batch] ${index + 1}/${farms.length} finished success=${result.success} stage=${result.stage}`
-      );
-
-      return result;
-    });
-
-    for (const result of results) {
-      if (!result.success || !result.file_path) continue;
-
-      const baseName = fileSafe(
-        `${result.farm_name || result.farm_id || 'farm'}-${result.client_personal_code || 'code'}-${result.search_date || 'date'}.pdf`
-      );
-
-      result.zip_file_name = `pdfs/${baseName.endsWith('.pdf') ? baseName : `${baseName}.pdf`}`;
-    }
-
-    const zipName = `vic-live-animals-${defaultSearchDate}-${Date.now()}.zip`;
-
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader(
-      'Content-Disposition',
-      `attachment; filename="${zipName}"`
-    );
-    res.setHeader('X-Total-Farms', String(results.length));
-    res.setHeader('X-Success-Count', String(results.filter((r) => r.success).length));
-    res.setHeader('X-Failed-Count', String(results.filter((r) => !r.success).length));
-
-    const archive = archiver('zip', {
-      zlib: { level: 1 }
-    });
-
-    archive.on('error', async (err) => {
-      console.error('[zip] archive error:', err);
-
-      await cleanupResultFiles(results).catch(() => null);
-
-      if (!res.headersSent) {
-        res.status(500).json({
-          ok: false,
-          error: err.message || String(err)
-        });
-      } else {
-        res.end();
-      }
-    });
-
-    archive.on('end', async () => {
-      await cleanupResultFiles(results).catch(() => null);
-    });
-
-    archive.pipe(res);
-
-    archive.append(JSON.stringify(buildManifest(results), null, 2), {
-      name: 'manifest.json'
-    });
-
-    for (const result of results) {
-      if (!result.success || !result.file_path) continue;
-
-      archive.file(result.file_path, {
-        name: result.zip_file_name
-      });
-    }
-
-    return archive.finalize();
-  } catch (err) {
-    console.error('[download-live-animals-pdfs] fatal:', err);
-
-    await cleanupResultFiles(results).catch(() => null);
-
-    return res.status(500).json({
-      ok: false,
-      error: err.message || String(err),
-      stack: err.stack || null,
-      partial_results: results.map((r) => ({
-        farm_id: r.farm_id,
-        farm_name: r.farm_name,
-        success: r.success,
-        stage: r.stage,
-        error: r.error || null
-      }))
-    });
-  }
 });
 
 app.post('/download-live-animals-pdf', requireInternalAuth, async (req, res) => {
@@ -1069,8 +892,13 @@ app.post('/download-live-animals-pdf', requireInternalAuth, async (req, res) => 
       getLithuaniaTodayDate()
     );
 
+    const rawFarm =
+      req.body.farm ||
+      (Array.isArray(req.body.farms) && req.body.farms.length > 0 ? req.body.farms[0] : null) ||
+      req.body;
+
     const farm = normalizeFarmInput(
-      req.body.farm || req.body,
+      rawFarm,
       defaultVetCredentials,
       defaultSearchDate
     );
@@ -1084,22 +912,21 @@ app.post('/download-live-animals-pdf', requireInternalAuth, async (req, res) => 
       });
     }
 
-    const fileName = fileSafe(
-      `live-animals-${result.farm_name || result.farm_id}-${result.client_personal_code}-${result.search_date}.pdf`
-    );
-
+    const originalFileName = `live-animals-${result.farm_name || result.farm_id}-${result.client_personal_code}-${result.search_date}.pdf`;
     const stat = await fs.stat(result.file_path);
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename="${fileName}"`
+      buildContentDispositionFileName(originalFileName)
     );
     res.setHeader('Content-Length', stat.size);
-    res.setHeader('X-Farm-Id', result.farm_id || '');
+
+    // Keep custom headers ASCII-safe too.
+    res.setHeader('X-Farm-Id', fileSafe(result.farm_id || ''));
     res.setHeader('X-Farm-Name', encodeURIComponent(result.farm_name || ''));
-    res.setHeader('X-Client-Personal-Code', result.client_personal_code || '');
-    res.setHeader('X-Search-Date', result.search_date || '');
+    res.setHeader('X-Client-Personal-Code', fileSafe(result.client_personal_code || ''));
+    res.setHeader('X-Search-Date', fileSafe(result.search_date || ''));
 
     const stream = fsSync.createReadStream(result.file_path);
 
@@ -1140,8 +967,10 @@ app.post('/download-live-animals-pdf', requireInternalAuth, async (req, res) => 
   }
 });
 
+// Backwards-compatible route.
+// If old n8n still sends farms[0], this returns only the first farm PDF.
 app.post('/run-batch', requireInternalAuth, async (req, res) => {
-  req.url = '/download-live-animals-pdfs';
+  req.url = '/download-live-animals-pdf';
   return app._router.handle(req, res);
 });
 
