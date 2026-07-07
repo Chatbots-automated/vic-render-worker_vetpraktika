@@ -1,13 +1,12 @@
 {
   "name": "vic-render-worker",
-  "version": "4.0.0",
+  "version": "5.0.0",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "archiver": "^7.0.1",
     "express": "^4.21.2",
     "playwright": "1.59.1"
   }
