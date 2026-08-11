@@ -5,7 +5,7 @@ const fsSync = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-console.log('SERVER VERSION: vic-single-pdf-stream-v5-header-safe');
+console.log('SERVER VERSION: vic-single-pdf-stream-v6-profile-select');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -350,6 +350,75 @@ async function loginToVic(page, vicUsername, vicPassword) {
   }
 }
 
+async function selectVicProfileIfNeeded(page) {
+  const currentUrl = page.url();
+  const bodyText = await getBodyTextPreview(page);
+
+  const isProfileSelectionPage =
+    currentUrl.includes('/GPSAS/Profile/ProfileSettings') ||
+    (bodyText || '').includes('Profilio pasirinkimas') ||
+    (bodyText || '').includes('Pasirinkite, kuriuo profiliu dirbsite');
+
+  if (!isProfileSelectionPage) {
+    console.log('[selectVicProfileIfNeeded] Profile selection not needed');
+    return;
+  }
+
+  console.log('[selectVicProfileIfNeeded] Profile selection page detected');
+
+  const preferredProfiles = [
+    'Telšių r. sav. (Vet. gydytojas)',
+    'Vet. gydytojas',
+    'Veterinarijos gydytojas'
+  ];
+
+  for (const profileText of preferredProfiles) {
+    const candidates = [
+      page.locator('a').filter({ hasText: profileText }).first(),
+      page.locator('button').filter({ hasText: profileText }).first(),
+      page.locator('input').filter({ hasText: profileText }).first(),
+      page.locator('tr').filter({ hasText: profileText }).first(),
+      page.locator('td').filter({ hasText: profileText }).first(),
+      page.locator('div').filter({ hasText: profileText }).first(),
+      page.locator('span').filter({ hasText: profileText }).first(),
+      page.getByText(profileText, { exact: false }).first()
+    ];
+
+    for (const locator of candidates) {
+      const count = await locator.count().catch(() => 0);
+
+      if (count <= 0) {
+        continue;
+      }
+
+      const visible = await locator.isVisible().catch(() => false);
+
+      if (!visible) {
+        continue;
+      }
+
+      console.log(`[selectVicProfileIfNeeded] Clicking profile: ${profileText}`);
+
+      await Promise.all([
+        page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => null),
+        locator.click({ timeout: 30000 })
+      ]);
+
+      await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
+      await page.waitForTimeout(2000);
+
+      console.log('[selectVicProfileIfNeeded] Profile clicked');
+      return;
+    }
+  }
+
+  const preview = await getBodyTextPreview(page);
+
+  throw new Error(
+    `VIC profile selection page shown, but Vet. gydytojas profile was not clickable. Preview: ${(preview || '').slice(0, 1500)}`
+  );
+}
+
 async function openLiveAnimalsPage(page) {
   await page.goto(LIVE_ANIMALS_URL, {
     waitUntil: 'domcontentloaded',
@@ -357,6 +426,27 @@ async function openLiveAnimalsPage(page) {
   });
 
   await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
+
+  const currentUrl = page.url();
+  const bodyText = await getBodyTextPreview(page);
+
+  const returnedToProfileSelection =
+    currentUrl.includes('/GPSAS/Profile/ProfileSettings') ||
+    (bodyText || '').includes('Profilio pasirinkimas') ||
+    (bodyText || '').includes('Pasirinkite, kuriuo profiliu dirbsite');
+
+  if (returnedToProfileSelection) {
+    console.log('[openLiveAnimalsPage] Returned to profile selection, selecting profile again');
+
+    await selectVicProfileIfNeeded(page);
+
+    await page.goto(LIVE_ANIMALS_URL, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60000
+    });
+
+    await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
+  }
 
   await page.locator('#AsmKodas').waitFor({
     state: 'visible',
@@ -727,6 +817,10 @@ async function processFarmToPdf(farm) {
     console.log(`[${runId}] Login as ${farm.vic_username}`);
     await loginToVic(page, farm.vic_username, farm.vic_password);
 
+    stage = 'select_profile';
+    console.log(`[${runId}] Select VIC profile if needed`);
+    await selectVicProfileIfNeeded(page);
+
     stage = 'open_live_animals_page';
     console.log(`[${runId}] Open live animals page`);
     await openLiveAnimalsPage(page);
@@ -876,7 +970,7 @@ async function processFarmToPdf(farm) {
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
-    version: 'vic-single-pdf-stream-v5-header-safe',
+    version: 'vic-single-pdf-stream-v6-profile-select',
     headless: HEADLESS
   });
 });
