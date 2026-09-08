@@ -5,7 +5,7 @@ const fsSync = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-console.log('SERVER VERSION: vic-single-pdf-stream-v6-profile-select');
+console.log('SERVER VERSION: vic-single-pdf-stream-v7-flexible-profile-select');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -361,61 +361,184 @@ async function selectVicProfileIfNeeded(page) {
 
   if (!isProfileSelectionPage) {
     console.log('[selectVicProfileIfNeeded] Profile selection not needed');
-    return;
+    return false;
   }
 
   console.log('[selectVicProfileIfNeeded] Profile selection page detected');
 
-  const preferredProfiles = [
-    'Telšių r. sav. (Vet. gydytojas)',
-    'Vet. gydytojas',
-    'Veterinarijos gydytojas'
+  const badProfileRegex = /įsagai|isagai|laikytojams/i;
+
+  const preferredProfileRegexes = [
+    /Privati\s+vet\.?\s+gydytoja/i,
+    /Privatus\s+vet\.?\s+gydytojas/i,
+    /Privati\s+veterinarijos\s+gydytoja/i,
+    /Privatus\s+veterinarijos\s+gydytojas/i,
+    /Vet\.?\s+gydytoja/i,
+    /Vet\.?\s+gydytojas/i,
+    /Veterinarijos\s+gydytoja/i,
+    /Veterinarijos\s+gydytojas/i,
+    /gydytoja/i,
+    /gydytojas/i,
+    /\bvet\b/i
   ];
 
-  for (const profileText of preferredProfiles) {
-    const candidates = [
-      page.locator('a').filter({ hasText: profileText }).first(),
-      page.locator('button').filter({ hasText: profileText }).first(),
-      page.locator('input').filter({ hasText: profileText }).first(),
-      page.locator('tr').filter({ hasText: profileText }).first(),
-      page.locator('td').filter({ hasText: profileText }).first(),
-      page.locator('div').filter({ hasText: profileText }).first(),
-      page.locator('span').filter({ hasText: profileText }).first(),
-      page.getByText(profileText, { exact: false }).first()
-    ];
+  async function getLocatorText(locator) {
+    return (
+      (await locator
+        .evaluate((el) => {
+          return (el.innerText || el.textContent || el.value || '')
+            .replace(/\s+/g, ' ')
+            .trim();
+        })
+        .catch(() => '')) || ''
+    );
+  }
 
-    for (const locator of candidates) {
-      const count = await locator.count().catch(() => 0);
+  async function stillOnProfileSelectionPage() {
+    const afterUrl = page.url();
+    const afterText = await getBodyTextPreview(page);
 
-      if (count <= 0) {
-        continue;
-      }
+    return (
+      afterUrl.includes('/GPSAS/Profile/ProfileSettings') ||
+      (afterText || '').includes('Profilio pasirinkimas') ||
+      (afterText || '').includes('Pasirinkite, kuriuo profiliu dirbsite')
+    );
+  }
 
-      const visible = await locator.isVisible().catch(() => false);
+  async function clickAndVerify(locator, label) {
+    const count = await locator.count().catch(() => 0);
+
+    if (count <= 0) {
+      return false;
+    }
+
+    for (let i = 0; i < Math.min(count, 10); i++) {
+      const candidate = locator.nth(i);
+
+      const visible = await candidate.isVisible().catch(() => false);
 
       if (!visible) {
         continue;
       }
 
-      console.log(`[selectVicProfileIfNeeded] Clicking profile: ${profileText}`);
+      const text = await getLocatorText(candidate);
+
+      if (!text) {
+        continue;
+      }
+
+      if (badProfileRegex.test(text)) {
+        console.log(`[selectVicProfileIfNeeded] Skipping non-vet profile: ${text}`);
+        continue;
+      }
+
+      console.log(`[selectVicProfileIfNeeded] Clicking profile via ${label}: ${text}`);
 
       await Promise.all([
         page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => null),
-        locator.click({ timeout: 30000 })
+        candidate.click({ timeout: 30000, force: true })
       ]);
 
       await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
       await page.waitForTimeout(2000);
 
-      console.log('[selectVicProfileIfNeeded] Profile clicked');
-      return;
+      if (!(await stillOnProfileSelectionPage())) {
+        console.log('[selectVicProfileIfNeeded] Profile selected successfully');
+        return true;
+      }
+
+      console.log('[selectVicProfileIfNeeded] Click happened but still on profile page, trying next candidate');
+    }
+
+    return false;
+  }
+
+  for (const regex of preferredProfileRegexes) {
+    const locators = [
+      page.locator('a').filter({ hasText: regex }),
+      page.locator('button').filter({ hasText: regex }),
+      page.locator('tr').filter({ hasText: regex }),
+      page.locator('td').filter({ hasText: regex }),
+      page.locator('div').filter({ hasText: regex }),
+      page.locator('span').filter({ hasText: regex }),
+      page.getByText(regex)
+    ];
+
+    for (const locator of locators) {
+      const clicked = await clickAndVerify(locator, String(regex));
+
+      if (clicked) {
+        return true;
+      }
+    }
+  }
+
+  const clickedByDomFallback = await page
+    .evaluate(() => {
+      const badRegex = /įsagai|isagai|laikytojams/i;
+      const goodRegex =
+        /privati\s+vet|privatus\s+vet|veterinarijos\s+gydytoja|veterinarijos\s+gydytojas|vet\.?\s+gydytoja|vet\.?\s+gydytojas|gydytoja|gydytojas/i;
+
+      const elements = Array.from(
+        document.querySelectorAll('a, button, input, tr, td, div, span')
+      );
+
+      const candidates = elements
+        .map((el) => {
+          const text = (el.innerText || el.textContent || el.value || '')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+
+          const visible =
+            rect.width > 0 &&
+            rect.height > 0 &&
+            style.display !== 'none' &&
+            style.visibility !== 'hidden';
+
+          return {
+            el,
+            text,
+            visible
+          };
+        })
+        .filter((item) => {
+          if (!item.visible) return false;
+          if (!item.text) return false;
+          if (badRegex.test(item.text)) return false;
+          return goodRegex.test(item.text);
+        });
+
+      if (!candidates.length) {
+        return null;
+      }
+
+      const chosen = candidates[0];
+      chosen.el.click();
+
+      return chosen.text;
+    })
+    .catch(() => null);
+
+  if (clickedByDomFallback) {
+    console.log(`[selectVicProfileIfNeeded] DOM fallback clicked profile: ${clickedByDomFallback}`);
+
+    await page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => null);
+    await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
+    await page.waitForTimeout(2000);
+
+    if (!(await stillOnProfileSelectionPage())) {
+      console.log('[selectVicProfileIfNeeded] Profile selected successfully with DOM fallback');
+      return true;
     }
   }
 
   const preview = await getBodyTextPreview(page);
 
   throw new Error(
-    `VIC profile selection page shown, but Vet. gydytojas profile was not clickable. Preview: ${(preview || '').slice(0, 1500)}`
+    `VIC profile selection page shown, but veterinary profile was not clickable. Preview: ${(preview || '').slice(0, 1500)}`
   );
 }
 
@@ -970,7 +1093,7 @@ async function processFarmToPdf(farm) {
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
-    version: 'vic-single-pdf-stream-v6-profile-select',
+    version: 'vic-single-pdf-stream-v7-flexible-profile-select',
     headless: HEADLESS
   });
 });
