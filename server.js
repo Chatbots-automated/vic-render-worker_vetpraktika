@@ -1,3 +1,4 @@
+
 const express = require('express');
 const { chromium } = require('playwright');
 const fs = require('fs/promises');
@@ -5,7 +6,9 @@ const fsSync = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-console.log('SERVER VERSION: vic-single-pdf-stream-v8-optional-client-code-fill');
+const VERSION = 'vic-single-pdf-stream-v9-disabled-holder-safe-selection';
+
+console.log(`SERVER VERSION: ${VERSION}`);
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
@@ -15,7 +18,10 @@ const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN;
 const HEADLESS = String(process.env.PLAYWRIGHT_HEADLESS || 'true') === 'true';
 
 const VIC_LOGIN_URL = 'https://ise.vic.lt/Public/Login.aspx';
-const LIVE_ANIMALS_URL = 'https://ise.vic.lt/GPSAS/Ataskaitos/GyvuGyvunuSarasas';
+const LIVE_ANIMALS_URL =
+  'https://ise.vic.lt/GPSAS/Ataskaitos/GyvuGyvunuSarasas';
+
+const TMP_DIR = '/tmp/vic-pdfs';
 
 function requireInternalAuth(req, res, next) {
   if (!INTERNAL_TOKEN) {
@@ -36,13 +42,11 @@ function requireInternalAuth(req, res, next) {
 }
 
 function normalizeValue(value) {
-  const cleaned = String(value ?? '').trim();
-  return cleaned || null;
+  return String(value ?? '').trim() || null;
 }
 
 function normalizeCompact(value) {
-  const cleaned = String(value ?? '').replace(/\s+/g, '').trim();
-  return cleaned || null;
+  return String(value ?? '').replace(/\s+/g, '').trim() || null;
 }
 
 function fileSafe(value) {
@@ -57,15 +61,13 @@ function fileSafe(value) {
     .slice(0, 140) || 'file';
 }
 
-function buildContentDispositionFileName(originalFileName) {
-  const asciiFileName = fileSafe(originalFileName)
-    .replace(/["\\]/g, '_');
-
-  const encodedFileName = encodeURIComponent(originalFileName)
+function buildContentDispositionFileName(filename) {
+  const ascii = fileSafe(filename).replace(/["\\]/g, '_');
+  const encoded = encodeURIComponent(filename)
     .replace(/['()]/g, escape)
     .replace(/\*/g, '%2A');
 
-  return `attachment; filename="${asciiFileName}"; filename*=UTF-8''${encodedFileName}`;
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
 }
 
 function getLithuaniaTodayDate() {
@@ -76,87 +78,99 @@ function getLithuaniaTodayDate() {
     day: '2-digit'
   }).formatToParts(new Date());
 
-  const year = parts.find((p) => p.type === 'year')?.value;
-  const month = parts.find((p) => p.type === 'month')?.value;
-  const day = parts.find((p) => p.type === 'day')?.value;
+  const get = type => parts.find(p => p.type === type)?.value;
 
-  return `${year}-${month}-${day}`;
+  return `${get('year')}-${get('month')}-${get('day')}`;
 }
 
-function normalizeDateValue(value, fallbackDate) {
+function normalizeDateValue(value, fallback) {
   const raw = String(value ?? '').trim();
 
   if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
     return raw;
   }
 
-  const digitsOnly = raw.replace(/[^\d]/g, '');
+  const digits = raw.replace(/\D/g, '');
 
-  if (digitsOnly.length === 8) {
-    if (digitsOnly.startsWith('20')) {
-      return `${digitsOnly.slice(0, 4)}-${digitsOnly.slice(4, 6)}-${digitsOnly.slice(6, 8)}`;
+  if (digits.length === 8) {
+    if (digits.startsWith('20')) {
+      return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 8)}`;
     }
 
-    return `${digitsOnly.slice(4, 8)}-${digitsOnly.slice(2, 4)}-${digitsOnly.slice(0, 2)}`;
+    return `${digits.slice(4, 8)}-${digits.slice(2, 4)}-${digits.slice(0, 2)}`;
   }
 
-  return fallbackDate || getLithuaniaTodayDate();
+  return fallback || getLithuaniaTodayDate();
+}
+
+function firstValue(...values) {
+  for (const value of values) {
+    const normalized = normalizeValue(value);
+    if (normalized) return normalized;
+  }
+  return null;
 }
 
 function getVetCredentialsFromBody(body) {
   const vet = body.vet || {};
 
   return {
-    vic_username:
-      normalizeValue(body.vic_username) ||
-      normalizeValue(body.vicUsername) ||
-      normalizeValue(body.vet_username) ||
-      normalizeValue(body.vetUsername) ||
-      normalizeValue(vet.vic_username) ||
-      normalizeValue(vet.vicUsername) ||
-      normalizeValue(vet.username),
-
-    vic_password:
-      normalizeValue(body.vic_password) ||
-      normalizeValue(body.vicPassword) ||
-      normalizeValue(body.vet_password) ||
-      normalizeValue(body.vetPassword) ||
-      normalizeValue(vet.vic_password) ||
-      normalizeValue(vet.vicPassword) ||
-      normalizeValue(vet.password)
+    vic_username: firstValue(
+      body.vic_username,
+      body.vicUsername,
+      body.vet_username,
+      body.vetUsername,
+      vet.vic_username,
+      vet.vicUsername,
+      vet.username
+    ),
+    vic_password: firstValue(
+      body.vic_password,
+      body.vicPassword,
+      body.vet_password,
+      body.vetPassword,
+      vet.vic_password,
+      vet.vicPassword,
+      vet.password
+    )
   };
 }
 
-function normalizeFarmInput(farm, defaultVetCredentials, defaultSearchDate) {
+function normalizeFarmInput(farm, credentials, searchDate) {
   return {
-    id: normalizeValue(farm.id || farm.farm_id),
-    name: normalizeValue(farm.name || farm.farm_name),
+    id: firstValue(farm.id, farm.farm_id),
+    name: firstValue(farm.name, farm.farm_name),
 
-    client_personal_code:
-      normalizeCompact(farm.client_personal_code) ||
-      normalizeCompact(farm.clientPersonalCode) ||
-      normalizeCompact(farm.personal_code) ||
-      normalizeCompact(farm.personalCode) ||
-      normalizeCompact(farm.holder_code) ||
-      normalizeCompact(farm.holderCode) ||
-      normalizeCompact(farm.farm_code) ||
-      normalizeCompact(farm.farmCode) ||
-      normalizeCompact(farm.code),
+    client_personal_code: normalizeCompact(
+      firstValue(
+        farm.client_personal_code,
+        farm.clientPersonalCode,
+        farm.personal_code,
+        farm.personalCode,
+        farm.holder_code,
+        farm.holderCode,
+        farm.farm_code,
+        farm.farmCode,
+        farm.code
+      )
+    ),
 
-    vic_username:
-      normalizeValue(farm.vet_vic_username) ||
-      normalizeValue(farm.vetVicUsername) ||
-      normalizeValue(farm.vic_username) ||
-      defaultVetCredentials.vic_username,
+    vic_username: firstValue(
+      farm.vet_vic_username,
+      farm.vetVicUsername,
+      farm.vic_username,
+      credentials.vic_username
+    ),
 
-    vic_password:
-      normalizeValue(farm.vet_vic_password) ||
-      normalizeValue(farm.vetVicPassword) ||
-      normalizeValue(farm.vic_password) ||
-      defaultVetCredentials.vic_password,
+    vic_password: firstValue(
+      farm.vet_vic_password,
+      farm.vetVicPassword,
+      farm.vic_password,
+      credentials.vic_password
+    ),
 
     search_date: normalizeDateValue(
-      farm.search_date || farm.searchDate || defaultSearchDate,
+      farm.search_date || farm.searchDate || searchDate,
       getLithuaniaTodayDate()
     ),
 
@@ -169,7 +183,7 @@ function normalizeFarmInput(farm, defaultVetCredentials, defaultSearchDate) {
 }
 
 async function createBrowser() {
-  return await chromium.launch({
+  return chromium.launch({
     headless: HEADLESS,
     args: [
       '--disable-dev-shm-usage',
@@ -181,20 +195,20 @@ async function createBrowser() {
 
 async function getBodyTextPreview(page) {
   try {
-    return await page.evaluate(() => {
-      return (document.body.innerText || '').slice(0, 5000);
-    });
+    return await page.evaluate(
+      () => (document.body.innerText || '').slice(0, 5000)
+    );
   } catch {
     return null;
   }
 }
 
-async function safeScreenshot(page, tmpDir, farmId, runId) {
+async function safeScreenshot(page, farmId, runId) {
   try {
-    const screenshotPath = path.join(
-      tmpDir,
-      `${fileSafe(farmId || 'unknown')}-${runId}-error.png`
-    );
+    await fs.mkdir(TMP_DIR, { recursive: true });
+
+    const filename = `${fileSafe(farmId)}-${runId}-error.png`;
+    const screenshotPath = path.join(TMP_DIR, filename);
 
     await page.screenshot({
       path: screenshotPath,
@@ -215,69 +229,26 @@ async function fillLoginField(page, selector, value) {
     timeout: 30000
   });
 
-  await locator.click({ timeout: 30000 });
-
-  await page.keyboard.press('Control+A').catch(() => null);
-  await page.keyboard.press('Meta+A').catch(() => null);
-  await page.keyboard.press('Backspace').catch(() => null);
-
+  await locator.click();
   await locator.fill('');
   await locator.type(String(value), { delay: 35 });
 
-  await locator.evaluate((el) => {
+  await locator.evaluate(el => {
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
     el.dispatchEvent(new Event('blur', { bubbles: true }));
   });
 
-  const actualValue = await locator.inputValue().catch(() => '');
-
-  if (!actualValue) {
-    throw new Error(`Login field did not fill correctly: ${selector}`);
+  if (!await locator.inputValue()) {
+    throw new Error(`Login field did not fill: ${selector}`);
   }
 }
 
-async function waitForLoginResult(page) {
-  await page
-    .waitForFunction(
-      () => {
-        const bodyText = document.body.innerText || '';
-
-        const hasGpsasLink =
-          Array.from(document.querySelectorAll('a')).some((a) => {
-            const href = a.href || '';
-            const text = a.textContent || '';
-
-            return (
-              href.includes('/GPSAS') ||
-              text.includes('Ūkinių gyvūnų registras')
-            );
-          });
-
-        const stillOnLogin =
-          !!document.querySelector('#ctl00_PublicPlaceHolder_UserName') ||
-          !!document.querySelector('#ctl00_PublicPlaceHolder_Password');
-
-        const hasLoginError =
-          bodyText.includes('Būtinas laukas') ||
-          bodyText.includes('Neteisingas') ||
-          bodyText.includes('neteisingas') ||
-          bodyText.includes('Nepavyko') ||
-          bodyText.includes('Klaida');
-
-        return hasGpsasLink || (stillOnLogin && hasLoginError);
-      },
-      null,
-      { timeout: 60000 }
-    )
-    .catch(() => null);
-}
-
-async function loginToVic(page, vicUsername, vicPassword) {
+async function loginToVic(page, username, password) {
   const maxAttempts = 3;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    console.log(`[loginToVic] attempt ${attempt}/${maxAttempts}`);
+    console.log(`[loginToVic] Attempt ${attempt}/${maxAttempts}`);
 
     await page.goto(VIC_LOGIN_URL, {
       waitUntil: 'domcontentloaded',
@@ -289,7 +260,7 @@ async function loginToVic(page, vicUsername, vicPassword) {
     await fillLoginField(
       page,
       '#ctl00_PublicPlaceHolder_UserName',
-      vicUsername
+      username
     );
 
     await page.waitForTimeout(300);
@@ -297,40 +268,29 @@ async function loginToVic(page, vicUsername, vicPassword) {
     await fillLoginField(
       page,
       '#ctl00_PublicPlaceHolder_Password',
-      vicPassword
+      password
     );
 
     await page.waitForTimeout(300);
 
-    const usernameValue = await page
-      .locator('#ctl00_PublicPlaceHolder_UserName')
-      .inputValue()
-      .catch(() => '');
-
-    const passwordValue = await page
-      .locator('#ctl00_PublicPlaceHolder_Password')
-      .inputValue()
-      .catch(() => '');
-
-    if (!usernameValue || !passwordValue) {
-      if (attempt === maxAttempts) {
-        throw new Error('Login fields were empty before submit.');
-      }
-
-      await page.waitForTimeout(1000);
-      continue;
-    }
-
     await Promise.all([
-      page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => null),
-      page.locator('#ctl00_PublicPlaceHolder_LoginButton').click()
+      page.waitForLoadState('domcontentloaded', {
+        timeout: 60000
+      }).catch(() => null),
+
+      page.locator(
+        '#ctl00_PublicPlaceHolder_LoginButton'
+      ).click()
     ]);
 
-    await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
-    await waitForLoginResult(page);
+    await page.waitForLoadState('networkidle', {
+      timeout: 30000
+    }).catch(() => null);
 
-    const bodyText = await getBodyTextPreview(page);
+    await page.waitForTimeout(1500);
+
     const currentUrl = page.url();
+    const bodyText = await getBodyTextPreview(page);
 
     const loggedIn =
       currentUrl.includes('/GPSAS') ||
@@ -339,16 +299,17 @@ async function loginToVic(page, vicUsername, vicPassword) {
       (bodyText || '').includes('Ataskaitos');
 
     if (loggedIn) {
-      console.log('[loginToVic] login success');
+      console.log('[loginToVic] Login successful');
       return;
     }
 
-    console.log(`[loginToVic] login not confirmed. URL=${currentUrl}`);
-    console.log(`[loginToVic] body preview: ${(bodyText || '').slice(0, 500)}`);
+    console.log(
+      `[loginToVic] Login not confirmed: ${currentUrl}`
+    );
 
     if (attempt === maxAttempts) {
       throw new Error(
-        `VIC login failed after ${maxAttempts} attempts. Preview: ${(bodyText || '').slice(0, 500)}`
+        `VIC login failed. Preview: ${(bodyText || '').slice(0, 500)}`
       );
     }
 
@@ -357,24 +318,22 @@ async function loginToVic(page, vicUsername, vicPassword) {
 }
 
 async function selectVicProfileIfNeeded(page) {
-  const currentUrl = page.url();
-  const bodyText = await getBodyTextPreview(page);
+  const url = page.url();
+  const text = await getBodyTextPreview(page);
 
-  const isProfileSelectionPage =
-    currentUrl.includes('/GPSAS/Profile/ProfileSettings') ||
-    (bodyText || '').includes('Profilio pasirinkimas') ||
-    (bodyText || '').includes('Pasirinkite, kuriuo profiliu dirbsite');
+  const isSelection =
+    url.includes('/GPSAS/Profile/ProfileSettings') ||
+    (text || '').includes('Profilio pasirinkimas') ||
+    (text || '').includes('Pasirinkite, kuriuo profiliu dirbsite');
 
-  if (!isProfileSelectionPage) {
-    console.log('[selectVicProfileIfNeeded] Profile selection not needed');
+  if (!isSelection) {
+    console.log('[selectVicProfile] Profile selection not needed');
     return false;
   }
 
-  console.log('[selectVicProfileIfNeeded] Profile selection page detected');
+  console.log('[selectVicProfile] Selecting veterinary profile');
 
-  const badProfileRegex = /įsagai|isagai|laikytojams/i;
-
-  const preferredProfileRegexes = [
+  const preferred = [
     /Privati\s+vet\.?\s+gydytoja/i,
     /Privatus\s+vet\.?\s+gydytojas/i,
     /Privati\s+veterinarijos\s+gydytoja/i,
@@ -384,176 +343,79 @@ async function selectVicProfileIfNeeded(page) {
     /Veterinarijos\s+gydytoja/i,
     /Veterinarijos\s+gydytojas/i,
     /gydytoja/i,
-    /gydytojas/i,
-    /\bvet\b/i
+    /gydytojas/i
   ];
 
-  async function getLocatorText(locator) {
+  const excluded = /įsagai|isagai|laikytojams/i;
+
+  async function stillOnSelection() {
+    const url = page.url();
+    const text = await getBodyTextPreview(page);
+
     return (
-      (await locator
-        .evaluate((el) => {
-          return (el.innerText || el.textContent || el.value || '')
-            .replace(/\s+/g, ' ')
-            .trim();
-        })
-        .catch(() => '')) || ''
+      url.includes('/GPSAS/Profile/ProfileSettings') ||
+      (text || '').includes('Profilio pasirinkimas') ||
+      (text || '').includes('Pasirinkite, kuriuo profiliu dirbsite')
     );
   }
 
-  async function stillOnProfileSelectionPage() {
-    const afterUrl = page.url();
-    const afterText = await getBodyTextPreview(page);
-
-    return (
-      afterUrl.includes('/GPSAS/Profile/ProfileSettings') ||
-      (afterText || '').includes('Profilio pasirinkimas') ||
-      (afterText || '').includes('Pasirinkite, kuriuo profiliu dirbsite')
-    );
-  }
-
-  async function clickAndVerify(locator, label) {
-    const count = await locator.count().catch(() => 0);
-
-    if (count <= 0) {
-      return false;
-    }
-
-    for (let i = 0; i < Math.min(count, 10); i++) {
-      const candidate = locator.nth(i);
-
-      const visible = await candidate.isVisible().catch(() => false);
-
-      if (!visible) {
-        continue;
-      }
-
-      const text = await getLocatorText(candidate);
-
-      if (!text) {
-        continue;
-      }
-
-      if (badProfileRegex.test(text)) {
-        console.log(`[selectVicProfileIfNeeded] Skipping non-vet profile: ${text}`);
-        continue;
-      }
-
-      console.log(`[selectVicProfileIfNeeded] Clicking profile via ${label}: ${text}`);
-
-      await Promise.all([
-        page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => null),
-        candidate.click({ timeout: 30000, force: true })
-      ]);
-
-      await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
-      await page.waitForTimeout(2000);
-
-      if (!(await stillOnProfileSelectionPage())) {
-        console.log('[selectVicProfileIfNeeded] Profile selected successfully');
-        return true;
-      }
-
-      console.log(
-        '[selectVicProfileIfNeeded] Click happened but still on profile page, trying next candidate'
-      );
-    }
-
-    return false;
-  }
-
-  for (const regex of preferredProfileRegexes) {
+  for (const regex of preferred) {
     const locators = [
       page.locator('a').filter({ hasText: regex }),
       page.locator('button').filter({ hasText: regex }),
       page.locator('tr').filter({ hasText: regex }),
       page.locator('td').filter({ hasText: regex }),
       page.locator('div').filter({ hasText: regex }),
-      page.locator('span').filter({ hasText: regex }),
-      page.getByText(regex)
+      page.locator('span').filter({ hasText: regex })
     ];
 
     for (const locator of locators) {
-      const clicked = await clickAndVerify(locator, String(regex));
-
-      if (clicked) {
-        return true;
-      }
-    }
-  }
-
-  const clickedByDomFallback = await page
-    .evaluate(() => {
-      const badRegex = /įsagai|isagai|laikytojams/i;
-
-      const goodRegex =
-        /privati\s+vet|privatus\s+vet|veterinarijos\s+gydytoja|veterinarijos\s+gydytojas|vet\.?\s+gydytoja|vet\.?\s+gydytojas|gydytoja|gydytojas/i;
-
-      const elements = Array.from(
-        document.querySelectorAll('a, button, input, tr, td, div, span')
+      const count = Math.min(
+        await locator.count().catch(() => 0),
+        10
       );
 
-      const candidates = elements
-        .map((el) => {
-          const text = (el.innerText || el.textContent || el.value || '')
+      for (let i = 0; i < count; i++) {
+        const candidate = locator.nth(i);
+
+        if (!await candidate.isVisible().catch(() => false)) {
+          continue;
+        }
+
+        const label = await candidate.evaluate(el =>
+          (el.innerText || el.textContent || '')
             .replace(/\s+/g, ' ')
-            .trim();
+            .trim()
+        ).catch(() => '');
 
-          const rect = el.getBoundingClientRect();
-          const style = window.getComputedStyle(el);
+        if (!label || excluded.test(label)) {
+          continue;
+        }
 
-          const visible =
-            rect.width > 0 &&
-            rect.height > 0 &&
-            style.display !== 'none' &&
-            style.visibility !== 'hidden';
+        try {
+          await candidate.click({
+            timeout: 3000
+          });
 
-          return {
-            el,
-            text,
-            visible
-          };
-        })
-        .filter((item) => {
-          if (!item.visible) return false;
-          if (!item.text) return false;
-          if (badRegex.test(item.text)) return false;
-          return goodRegex.test(item.text);
-        });
+          await page.waitForLoadState('domcontentloaded', {
+            timeout: 15000
+          }).catch(() => null);
 
-      if (!candidates.length) {
-        return null;
+          await page.waitForTimeout(1500);
+
+          if (!await stillOnSelection()) {
+            console.log('[selectVicProfile] Selected:', label);
+            return true;
+          }
+        } catch {
+          continue;
+        }
       }
-
-      const chosen = candidates[0];
-
-      chosen.el.click();
-
-      return chosen.text;
-    })
-    .catch(() => null);
-
-  if (clickedByDomFallback) {
-    console.log(
-      `[selectVicProfileIfNeeded] DOM fallback clicked profile: ${clickedByDomFallback}`
-    );
-
-    await page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => null);
-    await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
-    await page.waitForTimeout(2000);
-
-    if (!(await stillOnProfileSelectionPage())) {
-      console.log(
-        '[selectVicProfileIfNeeded] Profile selected successfully with DOM fallback'
-      );
-
-      return true;
     }
   }
-
-  const preview = await getBodyTextPreview(page);
 
   throw new Error(
-    `VIC profile selection page shown, but veterinary profile was not clickable. Preview: ${(preview || '').slice(0, 1500)}`
+    'VIC profile selection shown, but no veterinary profile could be selected.'
   );
 }
 
@@ -563,29 +425,22 @@ async function openLiveAnimalsPage(page) {
     timeout: 60000
   });
 
-  await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
+  await page.waitForLoadState('networkidle', {
+    timeout: 30000
+  }).catch(() => null);
 
-  const currentUrl = page.url();
-  const bodyText = await getBodyTextPreview(page);
+  let text = await getBodyTextPreview(page);
 
-  const returnedToProfileSelection =
-    currentUrl.includes('/GPSAS/Profile/ProfileSettings') ||
-    (bodyText || '').includes('Profilio pasirinkimas') ||
-    (bodyText || '').includes('Pasirinkite, kuriuo profiliu dirbsite');
-
-  if (returnedToProfileSelection) {
-    console.log(
-      '[openLiveAnimalsPage] Returned to profile selection, selecting profile again'
-    );
-
+  if (
+    page.url().includes('/GPSAS/Profile/ProfileSettings') ||
+    (text || '').includes('Profilio pasirinkimas')
+  ) {
     await selectVicProfileIfNeeded(page);
 
     await page.goto(LIVE_ANIMALS_URL, {
       waitUntil: 'domcontentloaded',
       timeout: 60000
     });
-
-    await page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null);
   }
 
   await page.locator('#AsmKodas').waitFor({
@@ -602,16 +457,11 @@ async function fillInputAndTriggerEvents(page, selector, value) {
     timeout: 30000
   });
 
-  await locator.click({ timeout: 30000 });
-
-  await page.keyboard.press('Control+A').catch(() => null);
-  await page.keyboard.press('Meta+A').catch(() => null);
-  await page.keyboard.press('Backspace').catch(() => null);
-
+  await locator.click();
   await locator.fill('');
   await locator.type(String(value), { delay: 35 });
 
-  await locator.evaluate((el) => {
+  await locator.evaluate(el => {
     el.dispatchEvent(new Event('input', { bubbles: true }));
     el.dispatchEvent(new Event('change', { bubbles: true }));
     el.dispatchEvent(new Event('blur', { bubbles: true }));
@@ -619,20 +469,150 @@ async function fillInputAndTriggerEvents(page, selector, value) {
 
   await page.waitForTimeout(500);
 
-  const actualValue = await locator.inputValue().catch(() => '');
+  const actual = await locator.inputValue();
 
-  if (!actualValue) {
-    throw new Error(`Input did not fill correctly: ${selector}`);
+  if (!actual) {
+    throw new Error(`Input did not fill: ${selector}`);
   }
 
-  return actualValue;
+  return actual;
+}
+
+// VIC can disable #AsmKodas for certain account profiles.
+// Never force-enable it. Check authorized herd selectors instead.
+
+async function getHolderSearchControls(page) {
+  return page.evaluate(() => {
+    const holder = document.querySelector('#AsmKodas');
+
+    const selects = Array.from(
+      document.querySelectorAll('select')
+    ).map(el => ({
+      id: el.id || '',
+      name: el.name || '',
+      disabled: el.disabled,
+      visible: !!el.getClientRects().length,
+      value: el.value,
+
+      options: Array.from(el.options).map(opt => ({
+        value: opt.value,
+        text: (opt.textContent || '').trim(),
+        selected: opt.selected
+      }))
+    }));
+
+    return {
+      holder: holder
+        ? {
+            disabled: holder.disabled,
+            value: holder.value
+          }
+        : null,
+      selects
+    };
+  });
+}
+
+function exactHerdCode(text) {
+  const match = String(text || '')
+    .trim()
+    .match(/^(\d{9,11})(?=\s|\(|$)/);
+
+  return match ? match[1] : null;
+}
+
+async function selectMatchingHerdWhenCodeDisabled(page, code) {
+  const state = await getHolderSearchControls(page);
+
+  if (!state.holder?.disabled) {
+    throw new Error(
+      'Herd fallback called when holder input is enabled.'
+    );
+  }
+
+  const matches = [];
+
+  for (const select of state.selects) {
+    if (select.disabled || !select.visible) {
+      continue;
+    }
+
+    for (const option of select.options) {
+      if (exactHerdCode(option.text) === code) {
+        matches.push({ select, option });
+      }
+    }
+  }
+
+  if (matches.length !== 1) {
+    const diagnostic = state.selects.map(el => ({
+      id: el.id,
+      name: el.name,
+      disabled: el.disabled,
+      visible: el.visible,
+      options: el.options
+        .map(option => option.text)
+        .slice(0, 15)
+    }));
+
+    throw new Error(
+      `VIC disabled #AsmKodas. Found ${matches.length} ` +
+      `exact enabled dropdown matches for ${code}. ` +
+      `Controls: ${JSON.stringify(diagnostic).slice(0, 3500)}`
+    );
+  }
+
+  const match = matches[0];
+
+  if (!match.select.id && !match.select.name) {
+    throw new Error(
+      'Matching herd selector has no stable ID or name.'
+    );
+  }
+
+  const selector = match.select.id
+    ? `select[id=${JSON.stringify(match.select.id)}]`
+    : `select[name=${JSON.stringify(match.select.name)}]`;
+
+  console.log(
+    '[fillClientCode] Selecting herd:',
+    match.option.text
+  );
+
+  await page.locator(selector).selectOption(
+    match.option.value
+  );
+
+  await page.waitForTimeout(500);
+
+  const selected = await page.locator(selector).evaluate(el => ({
+    value: el.value,
+    text: el.selectedOptions?.[0]?.textContent?.trim() || ''
+  }));
+
+  if (
+    selected.value !== match.option.value ||
+    exactHerdCode(selected.text) !== code
+  ) {
+    throw new Error(
+      `Herd selection failed: ${JSON.stringify(selected)}`
+    );
+  }
+
+  return {
+    mode: 'herd_dropdown',
+    code,
+    herd: selected.text
+  };
 }
 
 async function fillClientCode(page, code) {
   const cleanCode = normalizeCompact(code);
 
-  if (!cleanCode) {
-    throw new Error('Missing client personal/company code.');
+  if (!/^\d{9,11}$/.test(cleanCode || '')) {
+    throw new Error(
+      'Client personal/company code must contain 9–11 digits.'
+    );
   }
 
   const locator = page.locator('#AsmKodas').first();
@@ -642,172 +622,146 @@ async function fillClientCode(page, code) {
     timeout: 30000
   });
 
+  await page.waitForTimeout(700);
+
+  if (!await locator.isEnabled()) {
+    return selectMatchingHerdWhenCodeDisabled(
+      page,
+      cleanCode
+    );
+  }
+
   for (let attempt = 1; attempt <= 3; attempt++) {
-    console.log(`[fillClientCode] attempt ${attempt}, code=${cleanCode}`);
+    console.log(
+      `[fillClientCode] Attempt ${attempt}, code=${cleanCode}`
+    );
 
-    await locator.click({ timeout: 30000 });
+    if (!await locator.isEnabled()) {
+      return selectMatchingHerdWhenCodeDisabled(
+        page,
+        cleanCode
+      );
+    }
 
-    await page.keyboard.press('Control+A').catch(() => null);
-    await page.keyboard.press('Meta+A').catch(() => null);
-    await page.keyboard.press('Backspace').catch(() => null);
-
-    await locator.fill('');
-    await locator.type(cleanCode, { delay: 55 });
-
-    await page.waitForTimeout(1000);
-
-    await locator.evaluate((el) => {
-      el.dispatchEvent(new Event('input', { bubbles: true }));
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-    });
-
-    await locator.press('Enter').catch(() => null);
-    await page.waitForTimeout(700);
-
+    await locator.fill(cleanCode);
+    await locator.dispatchEvent('input');
+    await locator.dispatchEvent('change');
     await locator.press('Tab').catch(() => null);
+
     await page.waitForTimeout(800);
-
-    await locator.evaluate((el) => {
-      el.dispatchEvent(new Event('change', { bubbles: true }));
-      el.dispatchEvent(new Event('blur', { bubbles: true }));
-    });
-
-    await page.waitForTimeout(700);
 
     const actual = normalizeCompact(
       await locator.inputValue().catch(() => '')
     );
 
-    console.log(`[fillClientCode] actual=${actual}`);
-
     if (actual === cleanCode) {
-      return actual;
+      return {
+        mode: 'holder_input',
+        code: cleanCode
+      };
     }
   }
 
-  const actualValue = await locator.inputValue().catch(() => '');
-
   throw new Error(
-    `AsmKodas did not fill correctly. expected=${cleanCode}, actual=${actualValue}`
+    `AsmKodas did not retain requested code ${cleanCode}`
   );
 }
 
 async function clickSearch(page) {
-  const searchButton = page
-    .locator('#searchBtn, button:has-text("Ieškoti"), input[value="Ieškoti"]')
-    .first();
+  const search = page.locator(
+    '#searchBtn, button:has-text("Ieškoti"), input[value="Ieškoti"]'
+  ).first();
 
-  await searchButton.waitFor({
+  await search.waitFor({
     state: 'visible',
     timeout: 30000
   });
 
   await Promise.all([
-    page.waitForLoadState('networkidle', { timeout: 60000 }).catch(() => null),
-    searchButton.click()
+    page.waitForLoadState('networkidle', {
+      timeout: 60000
+    }).catch(() => null),
+
+    search.click()
   ]);
 
   await page.waitForTimeout(4000);
 }
 
 async function waitForSearchResultOrState(page) {
-  await page
-    .waitForFunction(
-      () => {
-        const bodyText = document.body.innerText || '';
+  await page.waitForFunction(() => {
+    const text = document.body.innerText || '';
+    const pdf = document.querySelector('#printBtn');
 
-        const pdfButton = document.querySelector('#printBtn');
+    const hasPdf =
+      !!pdf &&
+      pdf.offsetParent !== null &&
+      getComputedStyle(pdf).display !== 'none' &&
+      getComputedStyle(pdf).visibility !== 'hidden';
 
-        const hasVisiblePdfButton =
-          !!pdfButton &&
-          pdfButton.offsetParent !== null &&
-          window.getComputedStyle(pdfButton).display !== 'none' &&
-          window.getComputedStyle(pdfButton).visibility !== 'hidden';
+    const hasResults =
+      (
+        text.includes('Laikytojas') &&
+        text.includes('Asmens/įmonės kodas')
+      ) ||
+      (
+        text.includes('Bandos adresas') &&
+        text.includes('Rūšis')
+      ) ||
+      text.includes('Iš viso ataskaitoje') ||
+      text.includes('Iš viso:');
 
-        const hasResults =
-          bodyText.includes('Laikytojas') ||
-          bodyText.includes('Banda') ||
-          bodyText.includes('Rūšis') ||
-          bodyText.includes('Iš viso ataskaitoje') ||
-          bodyText.includes('Iš viso:');
+    const hasNoData =
+      /įrašų nerasta|duomenų nėra|nėra duomenų|nerasta/i
+        .test(text);
 
-        const hasNoDataMessage =
-          bodyText.includes('Pagal pasirinktus paieškos kriterijus įrašų nerasta') ||
-          bodyText.includes('įrašų nerasta') ||
-          bodyText.includes('Duomenų nėra') ||
-          bodyText.includes('duomenų nėra') ||
-          bodyText.includes('Nerasta') ||
-          bodyText.includes('nerasta') ||
-          bodyText.includes('Nėra duomenų') ||
-          bodyText.includes('nėra duomenų');
+    const hasValidation =
+      /privalomas|įveskite|neteisingas/i.test(text);
 
-        const hasValidationMessage =
-          bodyText.includes('Privalomas') ||
-          bodyText.includes('privalomas') ||
-          bodyText.includes('Įveskite') ||
-          bodyText.includes('įveskite') ||
-          bodyText.includes('Neteisingas') ||
-          bodyText.includes('neteisingas');
-
-        return (
-          hasVisiblePdfButton ||
-          hasResults ||
-          hasNoDataMessage ||
-          hasValidationMessage
-        );
-      },
-      null,
-      { timeout: 90000 }
-    )
-    .catch(() => null);
+    return hasPdf || hasResults || hasNoData || hasValidation;
+  }, null, {
+    timeout: 90000
+  }).catch(() => null);
 
   await page.waitForTimeout(1500);
 }
 
 async function detectNoRecords(page) {
-  const preview = await getBodyTextPreview(page);
-
-  const noRecords =
-    (preview || '').includes('Pagal pasirinktus paieškos kriterijus įrašų nerasta') ||
-    (preview || '').includes('įrašų nerasta') ||
-    (preview || '').includes('Duomenų nėra') ||
-    (preview || '').includes('duomenų nėra') ||
-    (preview || '').includes('Nėra duomenų') ||
-    (preview || '').includes('nėra duomenų') ||
-    (preview || '').includes('Nerasta') ||
-    (preview || '').includes('nerasta');
+  const text = await getBodyTextPreview(page);
 
   return {
-    noRecords,
-    bodyText: preview
+    noRecords:
+      /įrašų nerasta|duomenų nėra|nėra duomenų|nerasta/i
+        .test(text || ''),
+    bodyText: text
   };
 }
 
 async function detectLoadedResults(page) {
-  const preview = await getBodyTextPreview(page);
+  const text = await getBodyTextPreview(page);
 
   const hasHolder =
-    (preview || '').includes('Laikytojas') &&
-    (preview || '').includes('Asmens/įmonės kodas');
+    (text || '').includes('Laikytojas') &&
+    (text || '').includes('Asmens/įmonės kodas');
 
   const hasHerd =
-    (preview || '').includes('Banda') &&
-    (preview || '').includes('Rūšis');
+    (text || '').includes('Bandos adresas') &&
+    (text || '').includes('Rūšis');
 
   const hasSummary =
-    (preview || '').includes('Iš viso ataskaitoje') ||
-    (preview || '').includes('Iš viso:');
+    (text || '').includes('Iš viso ataskaitoje') ||
+    (text || '').includes('Iš viso:');
 
   return {
     hasResults: hasHolder || hasHerd || hasSummary,
-    bodyText: preview
+    bodyText: text
   };
 }
 
 async function getPdfButtonState(page) {
-  const pdfButton = page.locator('#printBtn').first();
+  const pdf = page.locator('#printBtn').first();
 
-  const exists = (await pdfButton.count().catch(() => 0)) > 0;
+  const exists = await pdf.count().catch(() => 0) > 0;
 
   if (!exists) {
     return {
@@ -816,17 +770,15 @@ async function getPdfButtonState(page) {
     };
   }
 
-  const visible = await pdfButton
-    .evaluate((el) => {
-      const style = window.getComputedStyle(el);
+  const visible = await pdf.evaluate(el => {
+    const style = getComputedStyle(el);
 
-      return (
-        el.offsetParent !== null &&
-        style.display !== 'none' &&
-        style.visibility !== 'hidden'
-      );
-    })
-    .catch(() => false);
+    return (
+      el.offsetParent !== null &&
+      style.display !== 'none' &&
+      style.visibility !== 'hidden'
+    );
+  }).catch(() => false);
 
   return {
     exists,
@@ -842,45 +794,25 @@ async function runSearchAndInspect(page) {
   const resultCheck = await detectLoadedResults(page);
   const pdfState = await getPdfButtonState(page);
 
-  const bodyText =
-    resultCheck.bodyText ||
-    noRecordCheck.bodyText ||
-    (await getBodyTextPreview(page));
-
   return {
     noRecordCheck,
     resultCheck,
     pdfState,
-    bodyText
+    bodyText:
+      resultCheck.bodyText ||
+      noRecordCheck.bodyText ||
+      await getBodyTextPreview(page)
   };
 }
 
 async function downloadPdf(page) {
-  const pdfButton = page.locator('#printBtn').first();
+  const pdf = page.locator('#printBtn').first();
 
-  const exists = (await pdfButton.count().catch(() => 0)) > 0;
+  const state = await getPdfButtonState(page);
 
-  if (!exists) {
-    throw new Error('PDF button #printBtn does not exist.');
-  }
-
-  const visible = await pdfButton
-    .evaluate((el) => {
-      const style = window.getComputedStyle(el);
-
-      return (
-        el.offsetParent !== null &&
-        style.display !== 'none' &&
-        style.visibility !== 'hidden'
-      );
-    })
-    .catch(() => false);
-
-  if (!visible) {
-    const preview = await getBodyTextPreview(page);
-
+  if (!state.exists || !state.visible) {
     throw new Error(
-      `PDF button #printBtn exists but is hidden. Preview: ${(preview || '').slice(0, 700)}`
+      'PDF button #printBtn is missing or hidden.'
     );
   }
 
@@ -888,19 +820,35 @@ async function downloadPdf(page) {
     timeout: 90000
   });
 
-  await pdfButton.click();
+  await pdf.click();
 
-  return await downloadPromise;
+  return downloadPromise;
+}
+
+async function verifyPdf(localPath) {
+  const handle = await fs.open(localPath, 'r');
+
+  try {
+    const buffer = Buffer.alloc(5);
+    await handle.read(buffer, 0, 5, 0);
+
+    if (buffer.toString('ascii') !== '%PDF-') {
+      throw new Error(
+        'Downloaded response is not a valid PDF file.'
+      );
+    }
+  } finally {
+    await handle.close();
+  }
 }
 
 async function processFarmToPdf(farm) {
   const runId = crypto.randomUUID();
   const startedAt = new Date().toISOString();
 
-  const tmpDir = '/tmp/vic-pdfs';
-  await fs.mkdir(tmpDir, { recursive: true });
+  await fs.mkdir(TMP_DIR, { recursive: true });
 
-  const resultBase = {
+  const base = {
     run_id: runId,
     farm_id: farm.id,
     farm_name: farm.name,
@@ -910,41 +858,43 @@ async function processFarmToPdf(farm) {
     started_at: startedAt
   };
 
-  if (!farm.id) {
+  function validationError(message) {
     return {
-      ...resultBase,
+      ...base,
       success: false,
       stage: 'validation',
-      error: 'Missing farm id.'
+      error: message,
+      finished_at: new Date().toISOString()
     };
+  }
+
+  if (!farm.id) {
+    return validationError('Missing farm id.');
   }
 
   if (!farm.vic_username || !farm.vic_password) {
-    return {
-      ...resultBase,
-      success: false,
-      stage: 'validation',
-      error: 'Missing VIC credentials.'
-    };
+    return validationError('Missing VIC credentials.');
   }
 
   if (!farm.client_personal_code) {
-    return {
-      ...resultBase,
-      success: false,
-      stage: 'validation',
-      error: 'Missing client_personal_code.'
-    };
+    return validationError('Missing client_personal_code.');
   }
 
-  const browser = await createBrowser();
+  if (!/^\d{9,11}$/.test(farm.client_personal_code)) {
+    return validationError(
+      'client_personal_code must contain 9–11 digits.'
+    );
+  }
 
+  let browser = null;
   let context = null;
   let page = null;
   let stage = 'started';
   let localPath = null;
 
   try {
+    browser = await createBrowser();
+
     context = await browser.newContext({
       acceptDownloads: true,
       viewport: {
@@ -956,7 +906,8 @@ async function processFarmToPdf(farm) {
     page = await context.newPage();
 
     stage = 'login';
-    console.log(`[${runId}] Login as ${farm.vic_username}`);
+
+    console.log(`[${runId}] Login: ${farm.vic_username}`);
 
     await loginToVic(
       page,
@@ -965,39 +916,41 @@ async function processFarmToPdf(farm) {
     );
 
     stage = 'select_profile';
-    console.log(`[${runId}] Select VIC profile if needed`);
 
     await selectVicProfileIfNeeded(page);
 
     stage = 'open_live_animals_page';
-    console.log(`[${runId}] Open live animals page`);
 
     await openLiveAnimalsPage(page);
 
+    stage = 'fill_client_code';
+
     if (farm.skip_client_code_fill) {
-      stage = 'skip_client_code';
+      const input = page.locator('#AsmKodas');
 
-      console.log(
-        `[${runId}] Skipping client code fill for this farm/login. client_personal_code=${farm.client_personal_code}`
+      const existingCode = normalizeCompact(
+        await input.inputValue().catch(() => '')
       );
+
+      if (existingCode !== farm.client_personal_code) {
+        throw new Error(
+          'Skipping client code entry is unsafe because ' +
+          'the current holder code does not match the requested farm.'
+        );
+      }
     } else {
-      stage = 'fill_client_code';
-
-      console.log(
-        `[${runId}] Fill client code ${farm.client_personal_code}`
-      );
-
-      await fillClientCode(
+      const selection = await fillClientCode(
         page,
         farm.client_personal_code
+      );
+
+      console.log(
+        `[${runId}] Holder selection:`,
+        JSON.stringify(selection)
       );
     }
 
     stage = 'fill_search_date';
-
-    console.log(
-      `[${runId}] Fill search date ${farm.search_date}`
-    );
 
     await fillInputAndTriggerEvents(
       page,
@@ -1005,15 +958,13 @@ async function processFarmToPdf(farm) {
       farm.search_date
     );
 
-    await page
-      .locator('#PaieskosData')
+    await page.locator('#PaieskosData')
       .press('Enter')
       .catch(() => null);
 
-    await page
-      .locator('h4:has-text("Gyvų gyvūnų sąrašas")')
-      .click()
-      .catch(() => null);
+    await page.locator(
+      'h4:has-text("Gyvų gyvūnų sąrašas")'
+    ).click().catch(() => null);
 
     await page.waitForTimeout(500);
 
@@ -1026,9 +977,7 @@ async function processFarmToPdf(farm) {
       !inspection.resultCheck.hasResults &&
       !inspection.pdfState.visible
     ) {
-      console.log(
-        `[${runId}] unclear result, retrying once`
-      );
+      console.log(`[${runId}] Retrying search once`);
 
       await page.waitForTimeout(1500);
 
@@ -1036,10 +985,6 @@ async function processFarmToPdf(farm) {
         await fillClientCode(
           page,
           farm.client_personal_code
-        );
-      } else {
-        console.log(
-          `[${runId}] Retry: still skipping client code fill for this farm/login`
         );
       }
 
@@ -1049,168 +994,115 @@ async function processFarmToPdf(farm) {
         farm.search_date
       );
 
-      await page
-        .locator('#PaieskosData')
+      await page.locator('#PaieskosData')
         .press('Enter')
         .catch(() => null);
 
-      await page
-        .locator('h4:has-text("Gyvų gyvūnų sąrašas")')
-        .click()
-        .catch(() => null);
-
-      await page.waitForTimeout(800);
+      await page.locator(
+        'h4:has-text("Gyvų gyvūnų sąrašas")'
+      ).click().catch(() => null);
 
       inspection = await runSearchAndInspect(page);
     }
 
-    const bodyTextPreview =
-      inspection.bodyText ||
-      inspection.noRecordCheck.bodyText ||
-      (await getBodyTextPreview(page));
-
-    const currentUrlAfterSearch = page.url();
-
     if (inspection.noRecordCheck.noRecords) {
       return {
-        ...resultBase,
+        ...base,
         success: false,
         stage: 'no_records_found',
-        error: 'No records found for selected search criteria.',
-        current_url: currentUrlAfterSearch,
+        error: 'No records found.',
+        current_url: page.url(),
         body_text_preview_after_search:
-          (bodyTextPreview || '').slice(0, 3000),
+          (inspection.bodyText || '').slice(0, 3000),
         finished_at: new Date().toISOString()
       };
     }
 
     if (!inspection.pdfState.visible) {
-      const shotPath = await safeScreenshot(
+      const screenshotPath = await safeScreenshot(
         page,
-        tmpDir,
         farm.id,
         runId
       );
 
       return {
-        ...resultBase,
+        ...base,
         success: false,
         stage: 'no_pdf_available',
-        error:
-          `PDF button hidden or unavailable. ` +
-          `pdfExists=${inspection.pdfState.exists}, ` +
-          `hasResults=${inspection.resultCheck.hasResults}`,
-        current_url: currentUrlAfterSearch,
+        error: 'PDF button hidden or unavailable.',
+        pdf_exists: inspection.pdfState.exists,
+        has_results: inspection.resultCheck.hasResults,
+        current_url: page.url(),
         body_text_preview_after_search:
-          (bodyTextPreview || '').slice(0, 3000),
-        screenshot_path: shotPath,
+          (inspection.bodyText || '').slice(0, 3000),
+        screenshot_path: screenshotPath,
         finished_at: new Date().toISOString()
       };
     }
 
     stage = 'download_pdf';
 
-    console.log(`[${runId}] Download PDF`);
-
     const download = await downloadPdf(page);
 
-    const suggestedName =
-      download.suggestedFilename();
+    const originalName = download.suggestedFilename() ||
+      `live-animals-${farm.name || farm.id}-${farm.search_date}.pdf`;
 
-    const cleanFarmName = fileSafe(
-      farm.name ||
-      farm.id ||
-      'farm'
-    );
+    let safeName = fileSafe(originalName);
 
-    const cleanCode = fileSafe(
-      farm.client_personal_code ||
-      'code'
-    );
-
-    const finalFileName = fileSafe(
-      suggestedName ||
-        `live-animals-${cleanFarmName}-${cleanCode}-${farm.search_date}.pdf`
-    );
+    if (!safeName.toLowerCase().endsWith('.pdf')) {
+      safeName += '.pdf';
+    }
 
     localPath = path.join(
-      tmpDir,
-      `${fileSafe(farm.id)}-${runId}-${
-        finalFileName.endsWith('.pdf')
-          ? finalFileName
-          : `${finalFileName}.pdf`
-      }`
+      TMP_DIR,
+      `${fileSafe(farm.id)}-${runId}-${safeName}`
     );
 
     await download.saveAs(localPath);
+    await verifyPdf(localPath);
 
     const stat = await fs.stat(localPath);
 
-    const currentUrl = page.url();
-
     return {
-      ...resultBase,
+      ...base,
       success: true,
       stage: 'done',
       file_name: path.basename(localPath),
       file_path: localPath,
       file_size: stat.size,
-      current_url: currentUrl,
+      current_url: page.url(),
       finished_at: new Date().toISOString()
     };
   } catch (err) {
-    const errorMessage =
-      err.message ||
-      String(err);
+    const bodyText = page
+      ? await getBodyTextPreview(page).catch(() => null)
+      : null;
 
-    const bodyTextPreview =
-      page
-        ? await getBodyTextPreview(page).catch(() => null)
-        : null;
-
-    const currentUrl =
-      page
-        ? page.url()
-        : null;
-
-    const shotPath =
-      page
-        ? await safeScreenshot(
-            page,
-            tmpDir,
-            farm.id,
-            runId
-          )
-        : null;
+    const screenshotPath = page
+      ? await safeScreenshot(page, farm.id, runId)
+      : null;
 
     if (localPath) {
-      await fs
-        .unlink(localPath)
-        .catch(() => null);
+      await fs.unlink(localPath).catch(() => null);
     }
 
     return {
-      ...resultBase,
+      ...base,
       success: false,
       stage,
-      error: errorMessage,
-      current_url: currentUrl,
-      body_text_preview:
-        (bodyTextPreview || '').slice(0, 3000),
-      screenshot_path: shotPath,
+      error: err.message || String(err),
+      current_url: page ? page.url() : null,
+      body_text_preview: (bodyText || '').slice(0, 3000),
+      screenshot_path: screenshotPath,
       finished_at: new Date().toISOString()
     };
   } finally {
     if (context) {
-      await context
-        .close()
-        .catch(() => null);
+      await context.close().catch(() => null);
     }
 
     if (browser) {
-      await browser
-        .close()
-        .catch(() => null);
+      await browser.close().catch(() => null);
     }
   }
 }
@@ -1218,226 +1110,142 @@ async function processFarmToPdf(farm) {
 app.get('/health', (_req, res) => {
   res.json({
     ok: true,
-    version:
-      'vic-single-pdf-stream-v8-optional-client-code-fill',
+    version: VERSION,
     headless: HEADLESS
   });
 });
 
+async function handleLiveAnimalsRequest(req, res) {
+  let result = null;
+
+  try {
+    const credentials = getVetCredentialsFromBody(req.body);
+
+    const searchDate = normalizeDateValue(
+      req.body.search_date || req.body.searchDate,
+      getLithuaniaTodayDate()
+    );
+
+    const rawFarm =
+      req.body.farm ||
+      (
+        Array.isArray(req.body.farms) &&
+        req.body.farms.length > 0
+          ? req.body.farms[0]
+          : null
+      ) ||
+      req.body;
+
+    const farm = normalizeFarmInput(
+      rawFarm,
+      credentials,
+      searchDate
+    );
+
+    result = await processFarmToPdf(farm);
+
+    if (!result.success) {
+      return res.status(422).json({
+        ok: false,
+        result
+      });
+    }
+
+    const filename =
+      `live-animals-${result.farm_name || result.farm_id}-` +
+      `${result.client_personal_code}-${result.search_date}.pdf`;
+
+    const stat = await fs.stat(result.file_path);
+
+    res.setHeader('Content-Type', 'application/pdf');
+
+    res.setHeader(
+      'Content-Disposition',
+      buildContentDispositionFileName(filename)
+    );
+
+    res.setHeader('Content-Length', stat.size);
+
+    res.setHeader(
+      'X-Farm-Id',
+      fileSafe(result.farm_id || '')
+    );
+
+    res.setHeader(
+      'X-Farm-Name',
+      encodeURIComponent(result.farm_name || '')
+    );
+
+    res.setHeader(
+      'X-Client-Personal-Code',
+      fileSafe(result.client_personal_code || '')
+    );
+
+    res.setHeader(
+      'X-Search-Date',
+      fileSafe(result.search_date || '')
+    );
+
+    const stream = fsSync.createReadStream(result.file_path);
+
+    const cleanup = async () => {
+      if (result?.file_path) {
+        await fs.unlink(result.file_path).catch(() => null);
+      }
+    };
+
+    res.on('close', cleanup);
+
+    stream.on('error', async err => {
+      console.error('[PDF Stream Error]', err);
+
+      await cleanup();
+
+      if (!res.headersSent) {
+        res.status(500).json({
+          ok: false,
+          error: err.message || String(err)
+        });
+      } else {
+        res.destroy(err);
+      }
+    });
+
+    return stream.pipe(res);
+  } catch (err) {
+    console.error('[VIC Worker Fatal Error]', err);
+
+    if (result?.file_path) {
+      await fs.unlink(result.file_path).catch(() => null);
+    }
+
+    if (res.headersSent) {
+      return res.destroy(err);
+    }
+
+    return res.status(500).json({
+      ok: false,
+      error: err.message || String(err)
+    });
+  }
+}
+
 app.post(
   '/download-live-animals-pdf',
   requireInternalAuth,
-  async (req, res) => {
-    let result = null;
-
-    try {
-      const defaultVetCredentials =
-        getVetCredentialsFromBody(req.body);
-
-      const defaultSearchDate =
-        normalizeDateValue(
-          req.body.search_date ||
-          req.body.searchDate,
-          getLithuaniaTodayDate()
-        );
-
-      const rawFarm =
-        req.body.farm ||
-        (
-          Array.isArray(req.body.farms) &&
-          req.body.farms.length > 0
-            ? req.body.farms[0]
-            : null
-        ) ||
-        req.body;
-
-      const farm =
-        normalizeFarmInput(
-          rawFarm,
-          defaultVetCredentials,
-          defaultSearchDate
-        );
-
-      result =
-        await processFarmToPdf(farm);
-
-      if (!result.success) {
-        return res.status(422).json({
-          ok: false,
-          result
-        });
-      }
-
-      const originalFileName =
-        `live-animals-${
-          result.farm_name ||
-          result.farm_id
-        }-${
-          result.client_personal_code
-        }-${
-          result.search_date
-        }.pdf`;
-
-      const stat =
-        await fs.stat(result.file_path);
-
-      res.setHeader(
-        'Content-Type',
-        'application/pdf'
-      );
-
-      res.setHeader(
-        'Content-Disposition',
-        buildContentDispositionFileName(
-          originalFileName
-        )
-      );
-
-      res.setHeader(
-        'Content-Length',
-        stat.size
-      );
-
-      res.setHeader(
-        'X-Farm-Id',
-        fileSafe(
-          result.farm_id ||
-          ''
-        )
-      );
-
-      res.setHeader(
-        'X-Farm-Name',
-        encodeURIComponent(
-          result.farm_name ||
-          ''
-        )
-      );
-
-      res.setHeader(
-        'X-Client-Personal-Code',
-        fileSafe(
-          result.client_personal_code ||
-          ''
-        )
-      );
-
-      res.setHeader(
-        'X-Search-Date',
-        fileSafe(
-          result.search_date ||
-          ''
-        )
-      );
-
-      const stream =
-        fsSync.createReadStream(
-          result.file_path
-        );
-
-      stream.on(
-        'close',
-        async () => {
-          if (result?.file_path) {
-            await fs
-              .unlink(
-                result.file_path
-              )
-              .catch(() => null);
-          }
-        }
-      );
-
-      stream.on(
-        'error',
-        async (err) => {
-          console.error(
-            '[download-live-animals-pdf] stream error:',
-            err
-          );
-
-          if (result?.file_path) {
-            await fs
-              .unlink(
-                result.file_path
-              )
-              .catch(() => null);
-          }
-
-          if (!res.headersSent) {
-            res.status(500).json({
-              ok: false,
-              error:
-                err.message ||
-                String(err)
-            });
-          }
-        }
-      );
-
-      return stream.pipe(res);
-    } catch (err) {
-      console.error(
-        '[download-live-animals-pdf] fatal:',
-        err
-      );
-
-      if (result?.file_path) {
-        await fs
-          .unlink(
-            result.file_path
-          )
-          .catch(() => null);
-      }
-
-      return res
-        .status(500)
-        .json({
-          ok: false,
-          error:
-            err.message ||
-            String(err),
-          stack:
-            err.stack ||
-            null
-        });
-    }
-  }
+  handleLiveAnimalsRequest
 );
 
+// Backward-compatible alias for existing workflows.
 app.post(
   '/run-batch',
   requireInternalAuth,
-  async (req, res) => {
-    req.url =
-      '/download-live-animals-pdf';
-
-    return app._router.handle(
-      req,
-      res
-    );
-  }
+  handleLiveAnimalsRequest
 );
 
-process.on(
-  'SIGINT',
-  async () => {
-    process.exit(0);
-  }
-);
+process.on('SIGINT', () => process.exit(0));
+process.on('SIGTERM', () => process.exit(0));
 
-process.on(
-  'SIGTERM',
-  async () => {
-    process.exit(0);
-  }
-);
-
-app.listen(
-  PORT,
-  () => {
-    console.log(
-      `vic worker listening on ${PORT}`
-    );
-  }
-);
+app.listen(PORT, () => {
+  console.log(`VIC worker listening on port ${PORT}`);
+});
